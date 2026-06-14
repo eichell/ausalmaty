@@ -217,7 +217,7 @@ TOOLS = [
 
 def _get_system_prompt() -> str:
     now = datetime.now(pytz.timezone(BOT_TIMEZONE))
-    return f"""Ты — Аяша, умная и профессиональная секретарь-ассистент. Сегодня: {now.strftime('%d %B %Y, %H:%M')} ({BOT_TIMEZONE}).
+    return f"""Ты — Goldee, умная и профессиональная секретарь-ассистент. Сегодня: {now.strftime('%d %B %Y, %H:%M')} ({BOT_TIMEZONE}).
 
 Твои возможности:
 🛫 Поиск авиабилетов — ищешь рейсы по всему миру через Amadeus

@@ -35,7 +35,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"Привет, {user.first_name}! 👋\n\n"
-        "Я — *Аяша*, ваш персональный секретарь-ассистент.\n\n"
+        "Я — *Goldee*, ваш персональный секретарь-ассистент.\n\n"
         "Что я умею:\n"
         "🛫 Поиск авиабилетов\n"
         "🏨 Поиск и бронирование отелей\n"
@@ -250,7 +250,7 @@ def main():
     app.add_handler(CommandHandler("bookings", cmd_bookings))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Аяша запущена! Ожидаю сообщения...")
+    logger.info("Goldee запущена! Ожидаю сообщения...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
