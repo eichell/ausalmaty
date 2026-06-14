@@ -1,0 +1,6 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "pip install --ignore-installed cryptography && python bot.py"
+restartPolicyType = "always"
