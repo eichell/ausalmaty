@@ -1,6 +1,5 @@
 [build]
-builder = "nixpacks"
-buildCommand = "pip install -r requirements.txt --break-system-packages"
+builder = "dockerfile"
 
 [deploy]
 startCommand = "python bot.py"
