@@ -1,6 +1,7 @@
 [build]
 builder = "nixpacks"
+buildCommand = "pip install -r requirements.txt --break-system-packages"
 
 [deploy]
-startCommand = "pip install --ignore-installed cryptography && python bot.py"
+startCommand = "python bot.py"
 restartPolicyType = "always"
