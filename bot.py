@@ -12,7 +12,8 @@ from telegram.constants import ChatAction, ParseMode
 
 import database as db
 import agent
-from config import TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS
+from config import TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, GROQ_API_KEY, OPENAI_API_KEY
+from tools.voice import transcribe_audio
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -208,6 +209,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_allowed(user.id):
+        return
+
+    if not GROQ_API_KEY and not OPENAI_API_KEY:
+        await update.message.reply_text(
+            "🎤 Голосовые сообщения не настроены.\n\n"
+            "Добавьте `GROQ_API_KEY` в переменные Railway (бесплатно на console.groq.com)."
+        )
+        return
+
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING,
+    )
+
+    try:
+        voice = update.message.voice or update.message.audio
+        tg_file = await context.bot.get_file(voice.file_id)
+        audio_bytes = await tg_file.download_as_bytearray()
+
+        text = await transcribe_audio(bytes(audio_bytes))
+
+        if not text:
+            await update.message.reply_text("😔 Не удалось распознать речь. Попробуйте ещё раз.")
+            return
+
+        await update.message.reply_text(f"🎤 *Распознано:* _{text}_", parse_mode=ParseMode.MARKDOWN)
+
+        response = await agent.process_message(user.id, text)
+        if len(response) > 4096:
+            for i in range(0, len(response), 4096):
+                await update.message.reply_text(response[i:i+4096], parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+
+    except Exception as e:
+        logger.error(f"Voice error for user {user.id}: {e}", exc_info=True)
+        await update.message.reply_text("😔 Ошибка при распознавании голоса.")
+
+
 async def post_init(application: Application):
     commands = [
         BotCommand("start", "Начать работу"),
@@ -249,6 +292,8 @@ def main():
     app.add_handler(CommandHandler("year", cmd_year))
     app.add_handler(CommandHandler("bookings", cmd_bookings))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.AUDIO, handle_voice))
 
     logger.info("Goldee запущена! Ожидаю сообщения...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
