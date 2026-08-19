@@ -2,9 +2,9 @@
 
     python -m factorbot.run --period in_sample --note "базовый momentum"
 
-Доступны momentum и value по отдельности и их композит. Режимного фильтра пока
-нет: ТЗ 13 требует добавлять ровно одну вещь за этап, и если результат меняется,
-должно быть понятно, от чего.
+Доступны momentum и value по отдельности, их композит и режимный фильтр.
+Фильтр отключаемый, и `--regime both` прогоняет обе версии рядом: ТЗ 7.1 требует
+обязательно сравнить результат с версией без фильтра.
 
 Каждый прогон дописывается в `experiments.log` (ТЗ 9.2.1). Это не отчётность:
 число испытаний входит в поправку Deflated Sharpe Ratio, без которой лучший
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from factorbot.factors.momentum import momentum
 from factorbot.factors.value import ValueRules, compute_yields, value_score
 from factorbot.normalize import normalize_within_sector
 from factorbot.portfolio import PortfolioRules
+from factorbot.regime import RegimeRules, build_regime_filter
 from factorbot.report import metrics as M
 from factorbot.universe import UniverseRules
 
@@ -129,6 +131,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--strategy", default="momentum", choices=sorted(STRATEGIES))
     parser.add_argument("--period", default="in_sample", choices=sorted(PERIODS))
     parser.add_argument("--note", default="", help="что изменено в этом прогоне (ТЗ 9.2.1)")
+    parser.add_argument(
+        "--regime", default="config", choices=["config", "on", "off", "both"],
+        help="режимный фильтр ТЗ 7.1; both прогоняет обе версии рядом",
+    )
     parser.add_argument("--plots", action="store_true", help="сохранить графики")
     parser.add_argument("--out", default="data/processed/report")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -154,25 +160,39 @@ def main(argv: list[str] | None = None) -> int:
         last_prices = panel.closeadj.ffill().iloc[-1] if len(panel.closeadj) else pd.Series()
         delisting = build_delisting_returns(securities, corp_actions, last_prices)
 
-        result = run_backtest(
-            panel, securities,
-            score_fn=STRATEGIES[args.strategy](cfg, conn),
-            universe_rules=UniverseRules.from_config(cfg.universe),
-            portfolio_rules=PortfolioRules.from_config(cfg.portfolio),
-            cost_model=CostModel.from_config(cfg.costs),
-            start=period.start,
-            end=min(period.end, date.today()),
-            delisting_returns=delisting,
-        )
+        base = RegimeRules.from_config(cfg.regime_filter)
+        wanted = {
+            "config": [base.enabled], "on": [True], "off": [False], "both": [False, True],
+        }[args.regime]
+
+        results = {}
+        for enabled in wanted:
+            rules = replace(base, enabled=enabled)
+            results[enabled] = run_backtest(
+                panel, securities,
+                score_fn=STRATEGIES[args.strategy](cfg, conn),
+                universe_rules=UniverseRules.from_config(cfg.universe),
+                portfolio_rules=PortfolioRules.from_config(cfg.portfolio),
+                cost_model=CostModel.from_config(cfg.costs),
+                start=period.start,
+                end=min(period.end, date.today()),
+                delisting_returns=delisting,
+                regime=build_regime_filter(panel, securities, rules),
+            )
     finally:
         conn.close()
 
-    net = M.summarize(result, benchmark)
-    gross = M.summarize(result, benchmark, gross=True)
-    _print_report(args, result, net, gross, benchmark)
+    primary = results[wanted[-1]]
+    result = primary
+    net = M.summarize(primary, benchmark)
+    gross = M.summarize(primary, benchmark, gross=True)
+    _print_report(args, primary, net, gross, benchmark, filtered=wanted[-1])
+
+    if len(results) > 1:
+        _print_regime_comparison(results, benchmark)
 
     append_experiment(
-        args.note, args.strategy, args.period,
+        args.note, f"{args.strategy}{'+filter' if wanted[-1] else ''}", args.period,
         f"CAGR {net.cagr:.2%} (до издержек {gross.cagr:.2%}), Sharpe {net.sharpe:.2f}, "
         f"maxDD {net.max_drawdown:.1%}, оборот {net.annual_turnover:.0%}/год",
     )
@@ -194,13 +214,38 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _print_report(args, result, net: M.Metrics, gross: M.Metrics, benchmark) -> None:
-    print(f"\n=== {args.strategy} / {args.period} ===")
+def _print_regime_comparison(results: dict[bool, object], benchmark) -> None:
+    """ТЗ 7.1: результаты с фильтром обязательно сравнить с версией без него."""
+    off, on = M.summarize(results[False], benchmark), M.summarize(results[True], benchmark)
+    print("\n=== режимный фильтр: с ним и без него (ТЗ 7.1) ===")
+    print(f"{'':28}{'без фильтра':>14}{'с фильтром':>14}")
+    for label, attr, fmt in [
+        ("CAGR", "cagr", "{:.2%}"),
+        ("Волатильность", "volatility", "{:.2%}"),
+        ("Sharpe", "sharpe", "{:.2f}"),
+        ("Макс. просадка", "max_drawdown", "{:.1%}"),
+        ("Просадка, мес.", "max_drawdown_months", "{:.0f}"),
+        ("Отставание от SPY, мес.", "max_underperformance_months", "{:.0f}"),
+        ("Оборот в год", "annual_turnover", "{:.0%}"),
+    ]:
+        print(f"{label:<28}{fmt.format(getattr(off, attr)):>14}"
+              f"{fmt.format(getattr(on, attr)):>14}")
+    share = results[True].risk_off_share
+    print(f"{'Ребалансировок в защите':<28}{'—':>14}{share:>13.0%}")
+
+
+def _print_report(args, result, net: M.Metrics, gross: M.Metrics, benchmark,
+                  *, filtered: bool = False) -> None:
+    suffix = " + режимный фильтр" if filtered else ""
+    print(f"\n=== {args.strategy}{suffix} / {args.period} ===")
     print(f"Период:                  {result.equity_net.index[0].date()} — "
           f"{result.equity_net.index[-1].date()}  ({net.years:.1f} лет)")
     print(f"Ребалансировок:          {net.n_rebalances}")
     print(f"Вселенная (медиана):     {int(result.universe_size.median())} бумаг")
     print(f"Делистингов в портфеле:  {result.delisted_hits}")
+    if filtered:
+        print(f"Ребалансировок в защите: {len(result.risk_off_dates)} "
+              f"({result.risk_off_share:.0%})")
     print()
     print(f"{'':24}{'после издержек':>16}{'до издержек':>16}")
     for label, attr, fmt in [

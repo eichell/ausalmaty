@@ -40,6 +40,7 @@ from factorbot.backtest.costs import CostModel, rebalance_cost, turnover
 from factorbot.backtest.delisting import DEFAULT_DELISTING_RETURN
 from factorbot.data.panel import PricePanel
 from factorbot.portfolio import PortfolioRules, equal_weights, select_portfolio
+from factorbot.regime import RegimeFilter
 from factorbot.universe import UniverseRules, build_universe
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,14 @@ class BacktestResult:
     costs: pd.Series = field(default_factory=lambda: pd.Series(dtype="float64"))
     universe_size: pd.Series = field(default_factory=lambda: pd.Series(dtype="int64"))
     delisted_hits: int = 0
+    #: Даты ребалансировки, на которых сработал режимный фильтр (ТЗ 7.1).
+    risk_off_dates: list[pd.Timestamp] = field(default_factory=list)
+
+    @property
+    def risk_off_share(self) -> float:
+        """Доля ребалансировок в защитном режиме — для сравнения версий (ТЗ 7.1)."""
+        total = self.n_rebalances
+        return len(self.risk_off_dates) / total if total else 0.0
 
     @property
     def returns_net(self) -> pd.Series:
@@ -96,6 +105,7 @@ def run_backtest(
     start: date | pd.Timestamp,
     end: date | pd.Timestamp,
     delisting_returns: pd.Series | None = None,
+    regime: RegimeFilter | None = None,
 ) -> BacktestResult:
     """Прогоняет стратегию на панели цен.
 
@@ -107,6 +117,8 @@ def run_backtest(
             за отбор, исполнение и учёт, но не за то, что считать баллом.
         delisting_returns: доходность ушедших бумаг. Пропуск означает −100%
             для всех (ТЗ 4.1).
+        regime: режимный фильтр (ТЗ 7.1). None означает прогон без фильтра —
+            именно с ним ТЗ требует сравнивать версию с фильтром.
     """
     start, end = pd.Timestamp(start), pd.Timestamp(end)
     if panel.trading_days.empty:
@@ -148,6 +160,7 @@ def run_backtest(
     costs_log: dict[pd.Timestamp, float] = {}
     universe_log: dict[pd.Timestamp, int] = {}
     delisted_hits = 0
+    risk_off_dates: list[pd.Timestamp] = []
 
     previous_day: pd.Timestamp | None = None
     recorded: list[pd.Timestamp] = []
@@ -167,30 +180,43 @@ def run_backtest(
 
         if today in schedule:
             signal_day = schedule[today]
-            universe = build_universe(panel, securities, signal_day, universe_rules)
-            universe_log[signal_day] = len(universe)
+            # Фильтр смотрит на рынок в день сигнала, а не исполнения (ТЗ 7.1).
+            risk_off = regime is not None and regime.is_risk_off(signal_day)
 
-            if len(universe) == 0:
-                # До первой покупки это разогрев, а не сбой: истории цен ещё нет.
-                report = log.info if not invested else log.warning
-                report("%s: вселенная пуста, портфель не меняется", signal_day.date())
+            target: pd.Series | None = None
+            if risk_off:
+                risk_off_dates.append(signal_day)
+                universe_log[signal_day] = 0
+                target = regime.risk_off_weights(today)
+                target = _tradable_at_execution_weights(target, last_alive, today)
             else:
-                scores = score_fn(panel, signal_day, universe)
-                selected = select_portfolio(
-                    scores, universe["sector"], portfolio_rules,
-                    held=pd.Index(list(positions)),
-                )
-                selected = _tradable_at_execution(selected, last_alive, today)
-                target = equal_weights(selected)
+                universe = build_universe(panel, securities, signal_day, universe_rules)
+                universe_log[signal_day] = len(universe)
+                if len(universe) == 0:
+                    # До первой покупки это разогрев, а не сбой: истории цен нет.
+                    report = log.info if not invested else log.warning
+                    report("%s: вселенная пуста, портфель не меняется", signal_day.date())
+                else:
+                    scores = score_fn(panel, signal_day, universe)
+                    selected = select_portfolio(
+                        scores, universe["sector"], portfolio_rules,
+                        held=pd.Index(list(positions)),
+                    )
+                    selected = _tradable_at_execution(selected, last_alive, today)
+                    target = equal_weights(selected)
 
+            if target is not None:
                 equity = sum(positions.values()) + cash
                 if equity <= 0:
                     raise RuntimeError(f"Капитал обнулился к {today.date()}.")
 
                 current = pd.Series(positions, dtype="float64") / equity
-                cost = rebalance_cost(
-                    current, target, universe["dollar_volume"], cost_model
+                # Оборот считается по всем затронутым бумагам, включая продаваемые,
+                # а они могли выпасть из вселенной — их ставку издержек надо знать.
+                liquidity = _average_dollar_volume(
+                    panel, signal_day, universe_rules.dollar_volume_window
                 )
+                cost = rebalance_cost(current, target, liquidity, cost_model)
                 turnover_log[today] = turnover(current, target)
                 costs_log[today] = cost
                 weights_log[today] = target
@@ -198,8 +224,8 @@ def run_backtest(
                 equity_after = equity * (1.0 - cost)
                 cost_factor *= 1.0 - cost
                 positions = {int(p): float(w * equity_after) for p, w in target.items()}
-                cash = 0.0
-                invested = invested or bool(positions)
+                cash = equity_after if target.empty else 0.0
+                invested = invested or bool(positions) or risk_off
 
             # Шаг 3: от открытия к закрытию уже новым составом.
             positions = _revalue(positions, panel.openadj, closeadj, today, today)
@@ -226,6 +252,7 @@ def run_backtest(
         costs=pd.Series(costs_log, name="costs").sort_index(),
         universe_size=pd.Series(universe_log, name="universe_size").sort_index(),
         delisted_hits=delisted_hits,
+        risk_off_dates=risk_off_dates,
     )
 
 
@@ -251,6 +278,31 @@ def _tradable_at_execution(
             len(selected) - len(alive),
         )
     return pd.Index(alive, name="permaticker")
+
+
+def _tradable_at_execution_weights(
+    target: pd.Series, last_alive: pd.Series, execution_day: pd.Timestamp
+) -> pd.Series:
+    """То же, что `_tradable_at_execution`, но для готовых весов.
+
+    Защитный актив тоже надо проверять: делистинг ETF редок, но подставить в
+    портфель бумагу, которой на эту дату нет, — способ получить плоскую кривую
+    вместо честного результата.
+    """
+    alive = _tradable_at_execution(pd.Index(target.index), last_alive, execution_day)
+    if len(alive) == len(target):
+        return target
+    kept = target.reindex(alive)
+    total = kept.sum()
+    return kept / total if total > 0 else pd.Series(dtype="float64", name="weight")
+
+
+def _average_dollar_volume(
+    panel: PricePanel, as_of: pd.Timestamp, window: int
+) -> pd.Series:
+    """Средний дневной оборот по всем бумагам панели — для ставки издержек (ТЗ 8)."""
+    day = panel.trading_days.get_loc(as_of)
+    return panel.dollar_volume.iloc[max(0, day - window + 1): day + 1].mean(skipna=True)
 
 
 def _revalue(
