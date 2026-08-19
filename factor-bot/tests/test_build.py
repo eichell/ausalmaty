@@ -151,3 +151,63 @@ def test_preflight_passes_when_the_required_tables_are_there():
 def test_preflight_refuses_to_start_without_the_required_tables():
     with pytest.raises(sharadar.SubscriptionError, match="Sharadar Core"):
         preflight(_Access({"SF1": False}))
+
+
+# --------------------------------------------------------------------------- #
+# Частота запросов к поставщику
+# --------------------------------------------------------------------------- #
+
+
+class _Response:
+    def __init__(self, status_code: int, payload: dict) -> None:
+        self.status_code = status_code
+        self.ok = status_code < 400
+        self._payload = payload
+        self.text = str(payload)
+
+    def json(self) -> dict:
+        return self._payload
+
+
+RATE_LIMITED = _Response(429, {"quandl_error": {
+    "code": "QELx06",
+    "message": "You have exceeded the API speed limit and your account has "
+               "temporarily been disabled.",
+}})
+
+
+def test_rate_limit_stops_the_probe_instead_of_hammering(monkeypatch):
+    """Бесплатный ключ отключается целиком. Продолжать проверку значит продлевать
+    блокировку — и разбираться потом часами."""
+    calls: list[str] = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return RATE_LIMITED
+
+    monkeypatch.setattr(sharadar.requests, "get", fake_get)
+    provider = sharadar.SharadarProvider(api_key="x", probe_interval_s=0)
+
+    with pytest.raises(sharadar.RateLimitError, match="QELx06"):
+        provider.check_access()
+    assert len(calls) == 1, "после отказа по частоте запросов больше быть не должно"
+
+
+def test_subscription_refusal_does_not_stop_the_probe(monkeypatch):
+    """Отказ по тарифу касается одной таблицы: остальные проверить надо."""
+    forbidden = _Response(403, {"quandl_error": {
+        "code": "QEPx05", "message": "You have attempted to view a table you have "
+                                     "not subscribed to."}})
+    monkeypatch.setattr(sharadar.requests, "get", lambda url, **kw: forbidden)
+    provider = sharadar.SharadarProvider(api_key="x", probe_interval_s=0)
+
+    access = provider.check_access()
+    assert len(access) == len(sharadar.TABLES)
+    assert not any(a.ok for a in access.values())
+
+
+def test_probe_without_a_key_says_so_instead_of_calling_out():
+    provider = sharadar.SharadarProvider(api_key="", probe_interval_s=0)
+    state = provider.probe_table("SEP")
+    assert not state.ok
+    assert "NASDAQ_DATA_LINK_API_KEY" in state.detail

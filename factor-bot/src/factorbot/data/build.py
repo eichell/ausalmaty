@@ -149,6 +149,12 @@ def main(argv: list[str] | None = None) -> int:
     log.info("Проверка доступа к таблицам Sharadar (ТЗ 4.2)")
     try:
         access = preflight(provider)
+    except sharadar.RateLimitError as exc:
+        log.error(
+            "Ключ временно отключён поставщиком за частоту запросов: %s\n"
+            "Это проходит само. Повторять сразу нельзя — счётчик продлевается.", exc,
+        )
+        return 3
     except sharadar.SubscriptionError as exc:
         # Тариф ключа — не программная ошибка, трейсбек тут только мешает.
         log.error("%s", exc)

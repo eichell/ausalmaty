@@ -61,6 +61,15 @@ class SubscriptionError(SharadarError):
     """Таблица не входит в тариф ключа. Отличается от сбоя сети: повтор не поможет."""
 
 
+class RateLimitError(SharadarError):
+    """Превышена частота запросов. В отличие от тарифа, проходит само — но не сразу.
+
+    Бесплатный ключ Nasdaq Data Link держит десятки запросов в сутки, и при
+    превышении аккаунт временно отключается целиком, а не отдельный эндпоинт.
+    Долбить его после этого бессмысленно и вредно: счётчик продлевается.
+    """
+
+
 @dataclass(frozen=True)
 class TableAccess:
     """Результат проверки доступа к одной таблице."""
@@ -95,6 +104,9 @@ class SharadarProvider(DataProvider):
     cache_dir: Path = Path("data/raw")
     max_wait_s: int = 900
     poll_interval_s: int = 15
+    #: Пауза между проверками таблиц. Бесплатный ключ отключается целиком, если
+    #: выпустить пять запросов подряд, и разбираться потом приходится часами.
+    probe_interval_s: float = 2.0
     name: str = "sharadar"
 
     def __post_init__(self) -> None:
@@ -154,11 +166,27 @@ class SharadarProvider(DataProvider):
 
         if r.ok:
             return TableAccess(table, True, r.status_code)
-        return TableAccess(table, False, r.status_code, _quandl_error(r))
+
+        detail = _quandl_error(r)
+        if _is_rate_limited(r, detail):
+            raise RateLimitError(detail)
+        return TableAccess(table, False, r.status_code, detail)
 
     def check_access(self) -> dict[str, TableAccess]:
-        """Проверяет тариф ключа по всем таблицам ТЗ 4.2."""
-        return {t: self.probe_table(t) for t in TABLES}
+        """Проверяет тариф ключа по всем таблицам ТЗ 4.2.
+
+        Между запросами стоит пауза, а при отказе по частоте проверка
+        прекращается: продолжать значит продлевать блокировку.
+
+        Raises:
+            RateLimitError: ключ временно отключён поставщиком.
+        """
+        access: dict[str, TableAccess] = {}
+        for i, table in enumerate(TABLES):
+            if i and self.probe_interval_s:
+                time.sleep(self.probe_interval_s)
+            access[table] = self.probe_table(table)
+        return access
 
     def _download_bulk(self, table: str) -> bytes:
         """Снимок таблицы целиком: qopts.export=true, затем ожидание готовности."""
@@ -192,6 +220,14 @@ class SharadarProvider(DataProvider):
                 )
             log.info("%s: снимок в статусе %s, жду %s с", table, status, self.poll_interval_s)
             time.sleep(self.poll_interval_s)
+
+
+#: Код Nasdaq Data Link для превышения частоты запросов.
+RATE_LIMIT_CODE = "QELx06"
+
+
+def _is_rate_limited(response: requests.Response, detail: str) -> bool:
+    return response.status_code == 429 or RATE_LIMIT_CODE in detail
 
 
 def _quandl_error(response: requests.Response) -> str:
