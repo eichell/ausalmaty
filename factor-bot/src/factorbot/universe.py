@@ -100,7 +100,7 @@ def build_universe(
         return _empty_universe()
 
     day = panel.trading_days.get_loc(as_of)
-    price = panel.close.iloc[day].reindex(columns)
+    price = panel.close_unadj.iloc[day].reindex(columns)
     traded_today = price.notna()
 
     window = panel.dollar_volume.iloc[

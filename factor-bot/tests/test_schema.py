@@ -39,10 +39,12 @@ def test_create_all_is_idempotent(conn):
 
 
 def test_prices_key_rejects_two_rows_for_one_day(conn):
-    row = [1001, "AAA", date(2005, 3, 31), 10.0, 11.0, 9.0, 10.5, 10.5, 1000.0, 10500.0]
-    conn.execute("INSERT INTO prices VALUES (" + ",".join(["?"] * 10) + ")", row)
+    row = [1001, "AAA", date(2005, 3, 31), 10.0, 11.0, 9.0, 10.5, 10.5, 10.5,
+           1000.0, 10500.0]
+    insert = "INSERT INTO prices VALUES (" + ",".join(["?"] * len(row)) + ")"
+    conn.execute(insert, row)
     with pytest.raises(duckdb.ConstraintException):
-        conn.execute("INSERT INTO prices VALUES (" + ",".join(["?"] * 10) + ")", row)
+        conn.execute(insert, row)
 
 
 # --------------------------------------------------------------------------- #

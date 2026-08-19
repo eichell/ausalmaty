@@ -52,7 +52,7 @@ def build_delisting_returns(
 
     if corp_actions is None or corp_actions.empty:
         log.warning(
-            "ACTIONS недоступна: делистинг всех %d бумаг считается как −100% (ТЗ 4.1). "
+            "ACTIONS недоступна: делистинг всех %d бумаг считается как −100%% (ТЗ 4.1). "
             "Поглощения при этом занижены.", len(out),
         )
         return out

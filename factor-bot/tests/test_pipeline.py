@@ -60,7 +60,7 @@ def db(tmp_path):
                 "permaticker": int(permaticker), "ticker": f"T{permaticker}",
                 "date": day.date(), "open": float(opens.loc[day]),
                 "high": price, "low": price, "close": price, "closeadj": price,
-                "volume": 1e6, "dollar_volume": 200e6,
+                "close_unadj": price, "volume": 1e6, "dollar_volume": 200e6,
             })
     conn.register("_p", pd.DataFrame(rows))
     conn.execute("INSERT INTO prices SELECT * FROM _p")
@@ -152,3 +152,93 @@ def test_costs_show_up_as_a_gap_between_gross_and_net(db):
     result = _run(panel, securities, sign=1.0)
     assert result.equity_gross.iloc[-1] > result.equity_net.iloc[-1]
     assert result.costs.sum() > 0
+
+
+# --------------------------------------------------------------------------- #
+# Value через движок: соединение живёт весь прогон (этап 3)
+# --------------------------------------------------------------------------- #
+
+
+def _load_reports(path, cheap: set[int]) -> None:
+    """Отчётность для тех же бумаг: половина дешёвая, половина дорогая.
+
+    Прибыль различается в десять раз, поэтому какая половина должна оказаться в
+    портфеле, известно заранее — но только при условии, что дешёвые и дорогие
+    есть в каждом секторе. Нормализация идёт внутри сектора (ТЗ 6.3), и лучшая
+    бумага сектора, где все дорогие, получает такой же z, как лучшая бумага
+    сектора, где все дешёвые. Это не дефект, а смысл процедуры.
+    """
+    from datetime import date as _date
+
+    from factorbot.data import pit
+
+    rows = []
+    for i, permaticker in enumerate(range(1000, 1000 + N_NAMES)):
+        netinc = 500.0 if permaticker in cheap else 50.0
+        rows.append({
+            "permaticker": permaticker, "ticker": f"T{permaticker}", "dimension": "ART",
+            "reportperiod": _date(2003, 3, 31), "calendardate": _date(2003, 3, 31),
+            "available_from": _date(2003, 5, 15), "revenue_ttm": netinc * 10,
+            "netinc_ttm": netinc, "opcf_ttm": netinc, "capex_ttm": -10.0,
+            "equity": None, "debt": None, "cash": None, "assets": None,
+            "sharesbas": None,
+        })
+        rows.append({
+            "permaticker": permaticker, "ticker": f"T{permaticker}", "dimension": "ARQ",
+            "reportperiod": _date(2003, 3, 31), "calendardate": _date(2003, 3, 31),
+            "available_from": _date(2003, 5, 15), "revenue_ttm": None,
+            "netinc_ttm": None, "opcf_ttm": None, "capex_ttm": None,
+            "equity": netinc * 4, "debt": 0.0, "cash": 0.0, "assets": None,
+            "sharesbas": 1000.0 + i,
+        })
+
+    conn = duckdb.connect(str(path))
+    try:
+        pit.load_fundamentals(conn, pd.DataFrame(rows))
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def db_with_reports(db):
+    # Сектор бумаги — i % 6, поэтому дешевизну задаём по i // 6: так в каждом
+    # секторе оказывается по две дешёвых и по две дорогих бумаги.
+    cheap = {1000 + i for i in range(N_NAMES) if (i // 6) % 2 == 0}
+    _load_reports(db, cheap)
+    return db, cheap
+
+
+def test_value_runs_through_the_engine_on_a_live_connection(db_with_reports):
+    """Фундаментал читается на каждой дате ребалансировки, а не один раз:
+    PIT-выборка зависит от даты, и один кадр на весь прогон — это look-ahead."""
+    from factorbot.factors.value import ValueRules, compute_yields, value_score
+
+    path, cheap = db_with_reports
+    conn = duckdb.connect(str(path), read_only=True)
+    try:
+        panel = load_price_panel(conn)
+        securities = conn.execute("SELECT * FROM securities").df()
+        rules = ValueRules(excluded_sector="Financials")
+
+        def score(p, as_of, universe):
+            yields = compute_yields(conn, p, as_of, list(universe.index))
+            return value_score(yields, universe["sector"], rules).reindex(universe.index)
+
+        result = run_backtest(
+            panel, securities, score_fn=score,
+            universe_rules=UniverseRules(),
+            portfolio_rules=PortfolioRules(top_n=6, buffer_rank=9, max_sector_weight=0.34),
+            cost_model=CostModel(),
+            start=START, end=END,
+        )
+    finally:
+        conn.close()
+
+    assert result.n_rebalances > 12
+    for weights in result.weights.values():
+        assert weights.sum() == pytest.approx(1.0)
+
+    # Дорогая половина в портфель попадать не должна: у неё прибыль в десять раз
+    # меньше при сопоставимой капитализации.
+    picked = {p for weights in result.weights.values() for p in weights.index}
+    assert picked <= cheap, f"в портфель попали дорогие бумаги: {sorted(picked - cheap)}"

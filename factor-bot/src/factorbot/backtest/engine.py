@@ -39,7 +39,6 @@ import pandas as pd
 from factorbot.backtest.costs import CostModel, rebalance_cost, turnover
 from factorbot.backtest.delisting import DEFAULT_DELISTING_RETURN
 from factorbot.data.panel import PricePanel
-from factorbot.normalize import normalize_within_sector
 from factorbot.portfolio import PortfolioRules, equal_weights, select_portfolio
 from factorbot.universe import UniverseRules, build_universe
 
@@ -101,9 +100,11 @@ def run_backtest(
     """Прогоняет стратегию на панели цен.
 
     Args:
-        score_fn: `(panel, as_of, universe) -> pd.Series` — сырой балл по бумагам
-            вселенной. Нормализацию и отбор делает движок, чтобы этап 2 и этап 4
-            отличались только этой функцией.
+        score_fn: `(panel, as_of, universe) -> pd.Series` — итоговый балл по
+            бумагам вселенной, уже нормализованный. Нормализация живёт в стратегии,
+            а не здесь: value усредняет z-оценки четырёх компонентов по отдельности
+            (ТЗ 6.3), и одним вызовом на выходе это не выражается. Движок отвечает
+            за отбор, исполнение и учёт, но не за то, что считать баллом.
         delisting_returns: доходность ушедших бумаг. Пропуск означает −100%
             для всех (ТЗ 4.1).
     """
@@ -174,10 +175,9 @@ def run_backtest(
                 report = log.info if not invested else log.warning
                 report("%s: вселенная пуста, портфель не меняется", signal_day.date())
             else:
-                raw = score_fn(panel, signal_day, universe)
-                z = normalize_within_sector(raw, universe["sector"])
+                scores = score_fn(panel, signal_day, universe)
                 selected = select_portfolio(
-                    z, universe["sector"], portfolio_rules,
+                    scores, universe["sector"], portfolio_rules,
                     held=pd.Index(list(positions)),
                 )
                 selected = _tradable_at_execution(selected, last_alive, today)

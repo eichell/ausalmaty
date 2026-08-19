@@ -237,3 +237,18 @@ def test_period_without_rebalance_dates_is_rejected():
             cost_model=NO_COSTS,
             start=pd.Timestamp("2005-06-06"), end=pd.Timestamp("2005-06-10"),
         )
+
+
+def test_delisting_warning_actually_renders(caplog):
+    """Литеральный процент в шаблоне лога ломает форматирование, и предупреждение
+    молча превращается в traceback логгера — то есть исчезает."""
+    import logging
+
+    from factorbot.backtest.delisting import build_delisting_returns
+
+    securities = make_securities([1, 2], delisted={2})
+    with caplog.at_level(logging.WARNING):
+        build_delisting_returns(securities, corp_actions=None)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("−100%" in m and "ТЗ 4.1" in m for m in messages)

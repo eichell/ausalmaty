@@ -15,8 +15,8 @@ from factorbot.data.schema import create_all
 def _prices(rows: list[tuple[int, date, float]]) -> pd.DataFrame:
     return pd.DataFrame([
         {"permaticker": pt, "ticker": "AAA", "date": d, "open": px, "high": px,
-         "low": px, "close": px, "closeadj": px, "volume": 1000.0,
-         "dollar_volume": px * 1000.0}
+         "low": px, "close": px, "closeadj": px, "close_unadj": px,
+         "volume": 1000.0, "dollar_volume": px * 1000.0}
         for pt, d, px in rows
     ])
 

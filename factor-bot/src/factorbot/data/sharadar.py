@@ -381,9 +381,10 @@ def normalize_sep(sep_raw: pd.DataFrame, tmap: pd.DataFrame) -> pd.DataFrame:
         "low": pd.to_numeric(df["low"], errors="coerce"),
         "close": pd.to_numeric(df["close"], errors="coerce"),
         "closeadj": pd.to_numeric(df["closeadj"], errors="coerce"),
+        "close_unadj": pd.to_numeric(unadj, errors="coerce"),
         "volume": pd.to_numeric(df["volume"], errors="coerce"),
     })
-    out["dollar_volume"] = pd.to_numeric(unadj, errors="coerce") * out["volume"]
+    out["dollar_volume"] = out["close_unadj"] * out["volume"]
     return out.drop_duplicates(subset=["permaticker", "date"], keep="last").reset_index(drop=True)
 
 

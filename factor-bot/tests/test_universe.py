@@ -39,7 +39,7 @@ def test_price_threshold_uses_the_unadjusted_series():
     """Скорректированная цена пересчитана от сегодняшней базы: акция за $40 в 1999
     году может числиться в панели за $3, и порог ТЗ 5 отсёк бы её задним числом."""
     panel = make_panel({1001: [3.0] * len(DAYS)}, DAYS)
-    raw = panel.close.copy()
+    raw = panel.close_unadj.copy()
     raw.loc[:, 1001] = 40.0
     panel = type(panel)(panel.closeadj, panel.openadj, raw, panel.dollar_volume)
 

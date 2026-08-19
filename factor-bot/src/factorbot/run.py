@@ -2,9 +2,9 @@
 
     python -m factorbot.run --period in_sample --note "базовый momentum"
 
-Сейчас доступна одна стратегия — momentum отдельно, без value и без режимного
-фильтра. Так требует ТЗ 13: каждый следующий этап добавляет ровно одну вещь, и
-если результат меняется, понятно, от чего.
+Доступны две стратегии по отдельности — momentum и value. Композита и режимного
+фильтра пока нет: ТЗ 13 требует добавлять ровно одну вещь за этап, и если
+результат меняется, должно быть понятно, от чего.
 
 Каждый прогон дописывается в `experiments.log` (ТЗ 9.2.1). Это не отчётность:
 число испытаний входит в поправку Deflated Sharpe Ratio, без которой лучший
@@ -28,6 +28,8 @@ from factorbot.config import load_config, load_dotenv
 from factorbot.data.panel import load_price_panel
 from factorbot.data.periods import PERIODS, open_period
 from factorbot.factors.momentum import momentum
+from factorbot.factors.value import ValueRules, compute_yields, value_score
+from factorbot.normalize import normalize_within_sector
 from factorbot.portfolio import PortfolioRules
 from factorbot.report import metrics as M
 from factorbot.universe import UniverseRules
@@ -37,7 +39,7 @@ log = logging.getLogger("factorbot.run")
 EXPERIMENTS_LOG = Path("experiments.log")
 
 
-def momentum_only(cfg):
+def momentum_only(cfg, conn):
     """Балл этапа 2: чистый импульс, без value и без фильтра (ТЗ 13.2)."""
 
     def score(panel, as_of, universe):
@@ -46,12 +48,28 @@ def momentum_only(cfg):
             lookback_days=int(cfg.factors.momentum.lookback_days),
             skip_days=int(cfg.factors.momentum.skip_days),
         )
-        return values.reindex(universe.index)
+        return normalize_within_sector(values.reindex(universe.index), universe["sector"])
 
     return score
 
 
-STRATEGIES = {"momentum": momentum_only}
+def value_only(cfg, conn):
+    """Балл этапа 3: композит доходностей, без momentum и без фильтра (ТЗ 13.3).
+
+    Фундаментал читается на каждой дате ребалансировки заново, через pit.py.
+    Кэшировать его между датами нельзя: смысл PIT-выборки в том, что она зависит
+    от даты, и один прочитанный кадр на весь прогон — это и есть look-ahead.
+    """
+    rules = ValueRules.from_config(cfg.factors, cfg.universe)
+
+    def score(panel, as_of, universe):
+        yields = compute_yields(conn, panel, as_of, list(universe.index))
+        return value_score(yields, universe["sector"], rules).reindex(universe.index)
+
+    return score
+
+
+STRATEGIES = {"momentum": momentum_only, "value": value_only}
 
 
 def load_benchmark(conn, ticker: str) -> pd.Series:
@@ -101,28 +119,30 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     period = PERIODS[args.period]
 
+    # Соединение живёт весь прогон: value читает фундаментал на каждой дате
+    # ребалансировки, и закрывать базу до конца бэктеста нельзя.
     conn = open_period(args.period, cfg.data.processed_dir)
     try:
         panel = load_price_panel(conn, end=period.end)
         securities = conn.execute("SELECT * FROM securities").df()
         corp_actions = conn.execute("SELECT * FROM corp_actions").df()
         benchmark = load_benchmark(conn, cfg.reporting.benchmark)
+
+        last_prices = panel.closeadj.ffill().iloc[-1] if len(panel.closeadj) else pd.Series()
+        delisting = build_delisting_returns(securities, corp_actions, last_prices)
+
+        result = run_backtest(
+            panel, securities,
+            score_fn=STRATEGIES[args.strategy](cfg, conn),
+            universe_rules=UniverseRules.from_config(cfg.universe),
+            portfolio_rules=PortfolioRules.from_config(cfg.portfolio),
+            cost_model=CostModel.from_config(cfg.costs),
+            start=period.start,
+            end=min(period.end, date.today()),
+            delisting_returns=delisting,
+        )
     finally:
         conn.close()
-
-    last_prices = panel.closeadj.ffill().iloc[-1] if len(panel.closeadj) else pd.Series()
-    delisting = build_delisting_returns(securities, corp_actions, last_prices)
-
-    result = run_backtest(
-        panel, securities,
-        score_fn=STRATEGIES[args.strategy](cfg),
-        universe_rules=UniverseRules.from_config(cfg.universe),
-        portfolio_rules=PortfolioRules.from_config(cfg.portfolio),
-        cost_model=CostModel.from_config(cfg.costs),
-        start=period.start,
-        end=min(period.end, date.today()),
-        delisting_returns=delisting,
-    )
 
     net = M.summarize(result, benchmark)
     gross = M.summarize(result, benchmark, gross=True)

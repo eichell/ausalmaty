@@ -12,9 +12,11 @@
     открытию следующего дня (ТЗ 7), а `open` у поставщика поправлен только на
     сплиты. Смешивать его с `closeadj` нельзя: разница — это дивидендная
     доходность, которая молча утекла бы в результат.
-*   `close` — цена как она была, без поправки на дивиденды. Нужна ровно для одного:
-    порога «дороже $5» (ТЗ 5). Скорректированный ряд для этого не годится — он
-    пересчитан от сегодняшней базы и в 1999 году показал бы другие деньги.
+*   `close_unadj` — цена, как она была в тот день, без единой поправки. Нужна в
+    двух местах: порог «дороже $5» (ТЗ 5) и рыночная капитализация (ТЗ 6.2).
+    Скорректированный ряд не годится ни там, ни там — он пересчитан от
+    сегодняшней базы, и умножать его на «тогдашнее» число акций нельзя: у любой
+    компании, делавшей сплит, капитализация выйдет неверной в разы.
 *   `dollar_volume` — для фильтра ликвидности (ТЗ 5) и выбора ставки издержек (ТЗ 8).
 """
 
@@ -36,7 +38,7 @@ class PricePanel:
 
     closeadj: pd.DataFrame
     openadj: pd.DataFrame
-    close: pd.DataFrame
+    close_unadj: pd.DataFrame
     dollar_volume: pd.DataFrame
 
     @property
@@ -88,7 +90,7 @@ def load_price_panel(
         params["permatickers"] = [int(p) for p in permatickers]
 
     sql = f"""
-        SELECT permaticker, date, open, close, closeadj, dollar_volume
+        SELECT permaticker, date, open, close, closeadj, close_unadj, dollar_volume
         FROM prices
         WHERE {' AND '.join(where)}
         ORDER BY date, permaticker
@@ -109,7 +111,7 @@ def load_price_panel(
     # День без цены открытия исполняется по закрытию. Иначе позиция теряет
     # движение этого дня целиком: и до открытия, и после него.
     openadj = openadj.fillna(closeadj)
-    close = df.pivot(index="date", columns="permaticker", values="close")
+    close_unadj = df.pivot(index="date", columns="permaticker", values="close_unadj")
     dollar_volume = df.pivot(index="date", columns="permaticker", values="dollar_volume")
 
     log.info(
@@ -117,7 +119,7 @@ def load_price_panel(
         len(closeadj), closeadj.shape[1],
         closeadj.index.min().date(), closeadj.index.max().date(),
     )
-    return PricePanel(closeadj, openadj, close, dollar_volume)
+    return PricePanel(closeadj, openadj, close_unadj, dollar_volume)
 
 
 def _empty_panel() -> PricePanel:
