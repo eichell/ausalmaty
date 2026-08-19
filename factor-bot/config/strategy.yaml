@@ -1,0 +1,72 @@
+# Все параметры стратегии. Констант в коде быть не должно (ТЗ 11).
+#
+# Значения здесь заданы ТЗ, а не подобраны. Любое изменение — это отдельное
+# испытание, которое обязано попасть в experiments.log (ТЗ 9.2.1).
+
+data:
+  provider: sharadar          # исследование (ТЗ 4)
+  venue: alpaca               # исполнение, вне объёма текущего этапа (ТЗ 2, 4.6)
+  raw_dir: data/raw
+  processed_dir: data/processed
+  full_db: data/processed/full.duckdb
+  # DAILY подключается только как контрольный источник (ТЗ 4.4).
+  load_daily_control: true
+
+periods:                      # ТЗ 9.1
+  warmup_days: 430
+  in_sample:  [1999-01-01, 2012-12-31]
+  validation: [2013-01-01, 2019-12-31]
+  holdout:    [2020-01-01, 2100-01-01]
+
+universe:                     # ТЗ 5
+  exchanges: [NYSE, NASDAQ, AMEX]
+  exclude_categories: [ETF, ETN, Fund, Trust, ADR, SPAC]
+  min_price: 5.0
+  min_dollar_volume: 5_000_000
+  dollar_volume_window: 60
+  min_price_history_months: 14
+  # Финансы исключаются из value, но остаются в momentum (ТЗ 5).
+  exclude_sector_from_value: Financials
+
+factors:
+  momentum:                   # ТЗ 6.1
+    lookback_days: 252
+    skip_days: 21
+    diagnostics:
+      mom_6_1_lookback_days: 126
+      volatility_window: 126
+  value:                      # ТЗ 6.2
+    components: [earnings_yield, sales_yield, book_to_market, fcf_yield]
+    # Бумага без трёх и более компонентов выбывает из value-ранжирования (ТЗ 6.3).
+    min_components: 2
+  normalization:              # ТЗ 6.3
+    winsorize: [0.01, 0.99]
+    rank_within: sector
+  weights:                    # ТЗ 6.3 — априорный выбор, не подбирать (ТЗ 9.2.3)
+    momentum: 0.5
+    value: 0.5
+
+portfolio:                    # ТЗ 7
+  top_n: 30
+  weighting: equal
+  max_sector_weight: 0.30
+  buffer_rank: 45
+  rebalance: month_end
+  execution_price: next_open
+
+regime_filter:                # ТЗ 7.1
+  enabled: true               # обязателен прогон и с false (ТЗ 7.1)
+  benchmark: SPY
+  sma_window: 200
+  risk_off_asset: SHY
+
+costs:                        # ТЗ 8
+  commission_bps: 0.0
+  slippage_bps_liquid: 10.0
+  slippage_bps_illiquid: 25.0
+  liquid_dollar_volume_threshold: 50_000_000
+  assumed_capital_usd: 10_000_000
+
+reporting:                    # ТЗ 10
+  benchmark: SPY
+  equity_curve_log_scale: true

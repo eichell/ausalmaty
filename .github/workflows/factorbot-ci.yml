@@ -1,0 +1,32 @@
+name: factorbot
+
+on:
+  push:
+    paths: ['factor-bot/**', '.github/workflows/factorbot-ci.yml']
+  pull_request:
+    paths: ['factor-bot/**', '.github/workflows/factorbot-ci.yml']
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: factor-bot
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Установка
+        run: pip install -e ".[dev]"
+
+      # ТЗ 4.8: правило, на котором держится достоверность проекта.
+      # Стоит перед тестами — нарушение границы важнее падающего теста.
+      - name: Граница PIT-доступа
+        run: bash scripts/check_pit_boundary.sh
+
+      - name: Тесты
+        run: python -m pytest -q
+
+      - name: Линтер
+        run: ruff check src tests
