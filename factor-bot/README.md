@@ -64,6 +64,25 @@ cp .env.example .env      # и заполнить
 | `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY` | только торгуемость и сверка цен (ТЗ 4.6) |
 | `FACTORBOT_UNLOCK_HOLDOUT` | замок hold-out (ТЗ 9.1), держать пустым до конца |
 
+### Сетевой доступ
+
+В облачной сессии Claude Code сеть ограничена политикой окружения, и `data.nasdaq.com`
+в список Trusted не входит. Окружение правится через селектор облака на
+claude.ai/code (иконка над полем ввода) → шестерёнка → **Network access: Custom**.
+Домены, по одному в строке, без схемы и порта:
+
+```
+data.nasdaq.com
+*.s3.amazonaws.com          # bulk-выгрузка отдаёт ссылку на архив уже на S3
+api.alpaca.markets
+paper-api.alpaca.markets
+data.alpaca.markets
+```
+
+Галочку «Also include default list of common package managers» надо оставить:
+без неё отвалится установка пакетов. Изменения применяются к новым сессиям —
+текущая продолжает работать со старой политикой.
+
 Проверить, что отдаёт ключ, до запуска суточной загрузки:
 
 ```bash
