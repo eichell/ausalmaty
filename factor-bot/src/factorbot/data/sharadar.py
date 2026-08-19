@@ -36,6 +36,15 @@ API_ROOT = "https://data.nasdaq.com/api/v3/datatables/SHARADAR"
 #: Таблицы из ТЗ 4.2. DAILY — только контрольный источник (ТЗ 4.4).
 TABLES: tuple[str, ...] = ("SF1", "SEP", "TICKERS", "ACTIONS", "DAILY")
 
+#: Без этих трёх не собирается ничего: справочник задаёт вселенную и карту
+#: permaticker, SEP даёт momentum, SF1 — value.
+REQUIRED_TABLES: tuple[str, ...] = ("TICKERS", "SEP", "SF1")
+
+#: ACTIONS нужна для корректных delisting returns (ТЗ 4.1), DAILY — только для
+#: сверки (ТЗ 4.4). Их отсутствие на урезанном тарифе не должно ронять загрузку,
+#: но обязано быть видно: без ACTIONS результат бэктеста завышен систематически.
+OPTIONAL_TABLES: tuple[str, ...] = ("ACTIONS", "DAILY")
+
 #: Измерения SF1, которые вообще попадают в базу (ТЗ 4.3). MR* отбрасываются
 #: на загрузке, а не на выборке: то, чего нет в файле, нельзя прочитать по ошибке.
 FLOW_FIELDS = {"revenue": "revenue_ttm", "netinc": "netinc_ttm",
@@ -46,6 +55,25 @@ STOCK_FIELDS = {"equity": "equity", "debt": "debt", "cashneq": "cash",
 
 class SharadarError(RuntimeError):
     """Ошибка загрузки, при которой продолжать бессмысленно."""
+
+
+class SubscriptionError(SharadarError):
+    """Таблица не входит в тариф ключа. Отличается от сбоя сети: повтор не поможет."""
+
+
+@dataclass(frozen=True)
+class TableAccess:
+    """Результат проверки доступа к одной таблице."""
+
+    table: str
+    ok: bool
+    http_status: int | None = None
+    detail: str = ""
+
+    def __str__(self) -> str:
+        mark = "доступна" if self.ok else "НЕТ ДОСТУПА"
+        tail = f" ({self.detail})" if self.detail else ""
+        return f"{self.table:<8} {mark}{tail}"
 
 
 # --------------------------------------------------------------------------- #
@@ -107,6 +135,31 @@ class SharadarProvider(DataProvider):
         archives = sorted(d.glob("*.zip"))
         return archives[-1] if archives else None
 
+    def probe_table(self, table: str) -> TableAccess:
+        """Одна строка из таблицы — дёшево и достаточно, чтобы узнать про тариф.
+
+        Урезанный ключ отвечает 403 с внятным текстом. Проверять это до запуска
+        суточной загрузки полезнее, чем узнавать на четвёртой таблице.
+        """
+        if not self.api_key:
+            return TableAccess(table, False, None, "не задан NASDAQ_DATA_LINK_API_KEY")
+        try:
+            r = requests.get(
+                f"{API_ROOT}/{table}.json",
+                params={"api_key": self.api_key, "qopts.per_page": 1},
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            return TableAccess(table, False, None, f"сеть: {exc.__class__.__name__}")
+
+        if r.ok:
+            return TableAccess(table, True, r.status_code)
+        return TableAccess(table, False, r.status_code, _quandl_error(r))
+
+    def check_access(self) -> dict[str, TableAccess]:
+        """Проверяет тариф ключа по всем таблицам ТЗ 4.2."""
+        return {t: self.probe_table(t) for t in TABLES}
+
     def _download_bulk(self, table: str) -> bytes:
         """Снимок таблицы целиком: qopts.export=true, затем ожидание готовности."""
         url = f"{API_ROOT}/{table}.json"
@@ -115,6 +168,10 @@ class SharadarProvider(DataProvider):
 
         while True:
             r = requests.get(url, params=params, timeout=60)
+            if r.status_code == 403:
+                raise SubscriptionError(
+                    f"{table}: ключ не даёт доступа к таблице. {_quandl_error(r)}"
+                )
             if r.status_code == 429:
                 # Лимит запросов поставщика. Ждать дешевле, чем падать посреди
                 # суточной загрузки пяти таблиц.
@@ -135,6 +192,18 @@ class SharadarProvider(DataProvider):
                 )
             log.info("%s: снимок в статусе %s, жду %s с", table, status, self.poll_interval_s)
             time.sleep(self.poll_interval_s)
+
+
+def _quandl_error(response: requests.Response) -> str:
+    """Достаёт текст ошибки поставщика; при неразборчивом ответе — код и начало тела."""
+    try:
+        err = response.json().get("quandl_error", {})
+        message = err.get("message")
+        if message:
+            return f"{err.get('code', '')} {message}".strip()
+    except ValueError:
+        pass
+    return f"HTTP {response.status_code}: {response.text[:200]}"
 
 
 def _read_csv_zip(blob: bytes) -> pd.DataFrame:

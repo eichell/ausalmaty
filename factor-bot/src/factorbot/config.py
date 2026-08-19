@@ -1,4 +1,4 @@
-"""Загрузка config/strategy.yaml (ТЗ 11: никаких констант в коде).
+"""Загрузка config/strategy.yaml (ТЗ 11: никаких констант в коде) и ключей из .env.
 
 Доступ через точку, потому что `cfg.portfolio.top_n` читается, а
 `cfg["portfolio"]["top_n"]` — расшифровывается. Проверка обязательных секций на
@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -15,11 +16,50 @@ from typing import Any
 import yaml
 
 DEFAULT_CONFIG_PATH = Path("config/strategy.yaml")
+DEFAULT_ENV_PATH = Path(".env")
 
 REQUIRED_SECTIONS = (
     "data", "periods", "universe", "factors", "portfolio", "regime_filter",
     "costs", "reporting",
 )
+
+
+def load_dotenv(path: str | Path = DEFAULT_ENV_PATH, *, override: bool = False) -> list[str]:
+    """Переносит ключи из .env в окружение процесса.
+
+    Ключи API в репозиторий не коммитятся: репозиторий на GitHub, а
+    опубликованный ключ находят сканеры. В git идёт только .env.example.
+
+    Уже заданная переменная окружения по умолчанию сильнее файла: в CI ключи
+    приходят из секретов, и файл не должен их перебивать.
+
+    Returns:
+        Имена переменных, которые были установлены из файла.
+    """
+    path = Path(path)
+    if not path.exists():
+        # Поиск вверх: скрипты запускают и из корня проекта, и из подкаталогов.
+        for parent in Path.cwd().resolve().parents[:3]:
+            candidate = parent / DEFAULT_ENV_PATH.name
+            if candidate.exists():
+                path = candidate
+                break
+        else:
+            return []
+
+    applied: list[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip().removeprefix("export ").strip()
+        value = value.strip().strip('"').strip("'")
+        if not key or (key in os.environ and not override):
+            continue
+        os.environ[key] = value
+        applied.append(key)
+    return applied
 
 
 class Section(Mapping):

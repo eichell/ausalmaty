@@ -2,6 +2,9 @@
 # Пакет src/factorbot/data — это код, а не данные; возвращаем его.
 !src/factorbot/data/
 
+# Ключи API. В репозиторий попадает только .env.example
+.env
+
 # Сырьё и собранные базы: гигабайты, воспроизводятся из build.py
 data/raw/
 data/processed/

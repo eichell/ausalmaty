@@ -9,8 +9,8 @@ import pandas as pd
 import pytest
 from test_sharadar import TICKERS_RAW
 
-from factorbot.data import pit
-from factorbot.data.build import build_full_database
+from factorbot.data import pit, sharadar
+from factorbot.data.build import build_full_database, preflight
 from factorbot.data.provider import DataProvider
 
 SEP_RAW = pd.DataFrame([
@@ -100,3 +100,54 @@ def test_rebuild_replaces_instead_of_appending(tmp_path):
     build_full_database(FakeProvider(), path)
     counts = build_full_database(FakeProvider(), path)
     assert counts["prices"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# Урезанный тариф ключа (ТЗ 4.1, 4.4)
+# --------------------------------------------------------------------------- #
+
+
+class RestrictedProvider(FakeProvider):
+    """Ключ без подписки на ACTIONS и DAILY — типичный бесплатный тариф."""
+
+    name = "restricted"
+    forbidden = {"ACTIONS", "DAILY"}
+
+    def fetch_table(self, table: str, *, force: bool = False) -> pd.DataFrame:
+        if table in self.forbidden:
+            raise sharadar.SubscriptionError(f"{table}: нет доступа по тарифу")
+        return super().fetch_table(table, force=force)
+
+
+def test_build_survives_a_restricted_key(tmp_path):
+    counts = build_full_database(RestrictedProvider(), tmp_path / "full.duckdb")
+    assert counts["prices"] == 2
+    assert counts["fundamental_rows"] == 1
+    assert counts["corp_actions"] == 0
+    assert counts["daily_control"] == 0
+
+
+def test_missing_actions_is_warned_about_not_swallowed(tmp_path, caplog):
+    """Без ACTIONS банкротство выглядит как исчезновение из выборки (ТЗ 4.1)."""
+    with caplog.at_level("WARNING"):
+        build_full_database(RestrictedProvider(), tmp_path / "full.duckdb")
+    assert any("ТЗ 4.1" in r.getMessage() for r in caplog.records)
+
+
+class _Access:
+    def __init__(self, ok: dict[str, bool]) -> None:
+        self._ok = ok
+
+    def check_access(self):
+        return {t: sharadar.TableAccess(t, self._ok.get(t, True)) for t in sharadar.TABLES}
+
+
+def test_preflight_passes_when_the_required_tables_are_there():
+    access = preflight(_Access({"ACTIONS": False, "DAILY": False}))
+    assert access["SEP"].ok
+    assert not access["ACTIONS"].ok
+
+
+def test_preflight_refuses_to_start_without_the_required_tables():
+    with pytest.raises(sharadar.SubscriptionError, match="Sharadar Core"):
+        preflight(_Access({"SF1": False}))

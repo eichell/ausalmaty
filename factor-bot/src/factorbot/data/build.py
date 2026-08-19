@@ -20,7 +20,7 @@ from pathlib import Path
 
 import duckdb
 
-from factorbot.config import load_config
+from factorbot.config import load_config, load_dotenv
 from factorbot.data import pit, sharadar
 from factorbot.data.periods import split_database
 from factorbot.data.schema import create_all
@@ -35,7 +35,13 @@ def build_full_database(
     load_daily_control: bool = True,
     force: bool = False,
 ) -> dict[str, int]:
-    """Собирает полную базу из сырых таблиц. Возвращает число строк по таблицам."""
+    """Собирает полную базу из сырых таблиц. Возвращает число строк по таблицам.
+
+    Таблицы ТЗ 4.1 (`ACTIONS`) и ТЗ 4.4 (`DAILY`) на урезанном тарифе могут быть
+    недоступны. Загрузка в этом случае продолжается, но пропуск фиксируется в
+    логе предупреждением: без `ACTIONS` банкротство выглядит как исчезновение из
+    выборки, а не как −100%, и результат завышается систематически.
+    """
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if db_path.exists():
@@ -60,20 +66,53 @@ def build_full_database(
         sf1 = sharadar.normalize_sf1(provider.fetch_table("SF1", force=force), sf1_map)
         counts["fundamental_rows"] = pit.load_fundamentals(conn, sf1)
 
-        actions = sharadar.normalize_actions(
-            provider.fetch_table("ACTIONS", force=force), sep_map
-        )
-        counts["corp_actions"] = _insert(conn, "corp_actions", actions)
+        actions_raw = _fetch_optional(provider, "ACTIONS", force=force)
+        if actions_raw is not None:
+            counts["corp_actions"] = _insert(
+                conn, "corp_actions", sharadar.normalize_actions(actions_raw, sep_map)
+            )
+        else:
+            counts["corp_actions"] = 0
+            log.warning(
+                "ACTIONS недоступна: delisting returns считать не из чего (ТЗ 4.1). "
+                "Бэктест на такой базе завышает доходность value-стратегии."
+            )
 
         if load_daily_control:
-            daily = sharadar.normalize_daily(
-                provider.fetch_table("DAILY", force=force), sep_map
+            daily_raw = _fetch_optional(provider, "DAILY", force=force)
+            counts["daily_control"] = (
+                _insert(conn, "daily_control", sharadar.normalize_daily(daily_raw, sep_map))
+                if daily_raw is not None else 0
             )
-            counts["daily_control"] = _insert(conn, "daily_control", daily)
     finally:
         conn.close()
 
     return counts
+
+
+def _fetch_optional(provider, table: str, *, force: bool):
+    """Таблица, отсутствие которой не останавливает сборку (ТЗ 4.1, 4.4)."""
+    try:
+        return provider.fetch_table(table, force=force)
+    except sharadar.SubscriptionError as exc:
+        log.warning("%s пропущена: %s", table, exc)
+        return None
+
+
+def preflight(provider: sharadar.SharadarProvider) -> dict[str, sharadar.TableAccess]:
+    """Печатает доступность таблиц и падает, если нет обязательных."""
+    access = provider.check_access()
+    for table in sharadar.TABLES:
+        state = access[table]
+        (log.info if state.ok else log.warning)("  %s", state)
+
+    missing = [t for t in sharadar.REQUIRED_TABLES if not access[t].ok]
+    if missing:
+        raise sharadar.SubscriptionError(
+            f"Без этих таблиц собирать нечего: {missing}. "
+            "Нужен ключ Nasdaq Data Link с подпиской на Sharadar Core US Equities."
+        )
+    return access
 
 
 def _insert(conn: duckdb.DuckDBPyConnection, table: str, df) -> int:
@@ -93,6 +132,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true", help="игнорировать кэш сырья")
     parser.add_argument("--skip-split", action="store_true",
                         help="не резать на периоды (только полная база)")
+    parser.add_argument("--check-access", action="store_true",
+                        help="только проверить, какие таблицы отдаёт ключ, и выйти")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -101,8 +142,24 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
 
+    load_dotenv()
     cfg = load_config(args.config)
     provider = sharadar.SharadarProvider(cache_dir=cfg.data.raw_dir)
+
+    log.info("Проверка доступа к таблицам Sharadar (ТЗ 4.2)")
+    try:
+        access = preflight(provider)
+    except sharadar.SubscriptionError as exc:
+        # Тариф ключа — не программная ошибка, трейсбек тут только мешает.
+        log.error("%s", exc)
+        return 2
+    if args.check_access:
+        return 0
+    if not all(access[t].ok for t in sharadar.OPTIONAL_TABLES):
+        log.warning(
+            "Часть таблиц вне тарифа. База соберётся, но полнота данных ниже "
+            "требований ТЗ 4.1/4.4 — это ограничение результата, а не мелочь."
+        )
 
     log.info("Сборка полной базы: %s", cfg.data.full_db)
     counts = build_full_database(

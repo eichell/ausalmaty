@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -51,3 +52,61 @@ def test_missing_section_is_rejected(tmp_path):
     path.write_text("data: {}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="секций"):
         load_config(path)
+
+
+# --------------------------------------------------------------------------- #
+# Ключи API: .env, не репозиторий
+# --------------------------------------------------------------------------- #
+
+
+def test_dotenv_values_reach_the_environment(tmp_path, monkeypatch):
+    from factorbot.config import load_dotenv
+
+    env = tmp_path / ".env"
+    env.write_text("NASDAQ_DATA_LINK_API_KEY=abc123\n", encoding="utf-8")
+    monkeypatch.delenv("NASDAQ_DATA_LINK_API_KEY", raising=False)
+
+    assert load_dotenv(env) == ["NASDAQ_DATA_LINK_API_KEY"]
+    assert os.environ["NASDAQ_DATA_LINK_API_KEY"] == "abc123"
+
+
+def test_existing_environment_wins_over_the_file(tmp_path, monkeypatch):
+    """В CI ключи приходят из секретов, и файл не должен их перебивать."""
+    from factorbot.config import load_dotenv
+
+    env = tmp_path / ".env"
+    env.write_text("NASDAQ_DATA_LINK_API_KEY=from_file\n", encoding="utf-8")
+    monkeypatch.setenv("NASDAQ_DATA_LINK_API_KEY", "from_ci")
+
+    assert load_dotenv(env) == []
+    assert os.environ["NASDAQ_DATA_LINK_API_KEY"] == "from_ci"
+
+
+def test_comments_quotes_and_export_prefix_are_handled(tmp_path, monkeypatch):
+    from factorbot.config import load_dotenv
+
+    env = tmp_path / ".env"
+    env.write_text(
+        '# комментарий\n\nexport A="one"\nB=\'two\'\nC=\nмусор без равенства\n',
+        encoding="utf-8",
+    )
+    for name in "ABC":
+        monkeypatch.delenv(name, raising=False)
+
+    assert load_dotenv(env) == ["A", "B", "C"]
+    assert os.environ["A"] == "one"
+    assert os.environ["B"] == "two"
+    assert os.environ["C"] == ""
+
+
+def test_missing_dotenv_is_not_an_error(tmp_path):
+    from factorbot.config import load_dotenv
+
+    assert load_dotenv(tmp_path / "нет-такого") == []
+
+
+def test_repository_ships_an_example_but_never_a_real_key():
+    root = CONFIG_PATH.parent.parent
+    assert (root / ".env.example").exists()
+    ignored = (root / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert ".env" in ignored, "ключи не должны попадать в git"
