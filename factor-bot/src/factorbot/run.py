@@ -2,9 +2,9 @@
 
     python -m factorbot.run --period in_sample --note "базовый momentum"
 
-Доступны две стратегии по отдельности — momentum и value. Композита и режимного
-фильтра пока нет: ТЗ 13 требует добавлять ровно одну вещь за этап, и если
-результат меняется, должно быть понятно, от чего.
+Доступны momentum и value по отдельности и их композит. Режимного фильтра пока
+нет: ТЗ 13 требует добавлять ровно одну вещь за этап, и если результат меняется,
+должно быть понятно, от чего.
 
 Каждый прогон дописывается в `experiments.log` (ТЗ 9.2.1). Это не отчётность:
 число испытаний входит в поправку Deflated Sharpe Ratio, без которой лучший
@@ -27,6 +27,7 @@ from factorbot.backtest.engine import run_backtest
 from factorbot.config import load_config, load_dotenv
 from factorbot.data.panel import load_price_panel
 from factorbot.data.periods import PERIODS, open_period
+from factorbot.factors.composite import CompositeRules, combine
 from factorbot.factors.momentum import momentum
 from factorbot.factors.value import ValueRules, compute_yields, value_score
 from factorbot.normalize import normalize_within_sector
@@ -39,10 +40,10 @@ log = logging.getLogger("factorbot.run")
 EXPERIMENTS_LOG = Path("experiments.log")
 
 
-def momentum_only(cfg, conn):
-    """Балл этапа 2: чистый импульс, без value и без фильтра (ТЗ 13.2)."""
+def _momentum_z(cfg):
+    """z-оценка импульса. Общая для этапа 2 и композита — расчёт должен быть один."""
 
-    def score(panel, as_of, universe):
+    def z(panel, as_of, universe):
         values = momentum(
             panel, as_of,
             lookback_days=int(cfg.factors.momentum.lookback_days),
@@ -50,26 +51,48 @@ def momentum_only(cfg, conn):
         )
         return normalize_within_sector(values.reindex(universe.index), universe["sector"])
 
-    return score
+    return z
 
 
-def value_only(cfg, conn):
-    """Балл этапа 3: композит доходностей, без momentum и без фильтра (ТЗ 13.3).
-
-    Фундаментал читается на каждой дате ребалансировки заново, через pit.py.
-    Кэшировать его между датами нельзя: смысл PIT-выборки в том, что она зависит
-    от даты, и один прочитанный кадр на весь прогон — это и есть look-ahead.
-    """
+def _value_z(cfg, conn):
+    """z-оценка value. Фундаментал читается на каждой дате заново (ТЗ 4.8)."""
     rules = ValueRules.from_config(cfg.factors, cfg.universe)
 
-    def score(panel, as_of, universe):
+    def z(panel, as_of, universe):
         yields = compute_yields(conn, panel, as_of, list(universe.index))
         return value_score(yields, universe["sector"], rules).reindex(universe.index)
 
+    return z
+
+
+def momentum_only(cfg, conn):
+    """Балл этапа 2: чистый импульс, без value и без фильтра (ТЗ 13.2)."""
+    return _momentum_z(cfg)
+
+
+def value_only(cfg, conn):
+    """Балл этапа 3: композит доходностей, без momentum и без фильтра (ТЗ 13.3)."""
+    return _value_z(cfg, conn)
+
+
+def composite(cfg, conn):
+    """Балл этапа 4: 0.5 * z_momentum + 0.5 * z_value (ТЗ 6.3, 13.4).
+
+    Веса берутся из конфига и не подбираются по результату (ТЗ 9.2.3).
+    """
+    rules = CompositeRules.from_config(cfg.factors)
+    momentum_z, value_z = _momentum_z(cfg), _value_z(cfg, conn)
+
+    def score(panel, as_of, universe):
+        return combine({
+            "momentum": momentum_z(panel, as_of, universe),
+            "value": value_z(panel, as_of, universe),
+        }, rules)
+
     return score
 
 
-STRATEGIES = {"momentum": momentum_only, "value": value_only}
+STRATEGIES = {"momentum": momentum_only, "value": value_only, "composite": composite}
 
 
 def load_benchmark(conn, ticker: str) -> pd.Series:

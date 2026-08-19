@@ -242,3 +242,85 @@ def test_value_runs_through_the_engine_on_a_live_connection(db_with_reports):
     # меньше при сопоставимой капитализации.
     picked = {p for weights in result.weights.values() for p in weights.index}
     assert picked <= cheap, f"в портфель попали дорогие бумаги: {sorted(picked - cheap)}"
+
+
+def test_composite_runs_and_holds_names_both_halves_like(db_with_reports):
+    """Этап 4: 0.5 * z_momentum + 0.5 * z_value через тот же движок."""
+    from factorbot.factors.composite import CompositeRules, combine
+    from factorbot.factors.momentum import momentum as momentum_factor
+    from factorbot.factors.value import ValueRules, compute_yields, value_score
+    from factorbot.normalize import normalize_within_sector
+
+    path, cheap = db_with_reports
+    conn = duckdb.connect(str(path), read_only=True)
+    try:
+        panel = load_price_panel(conn)
+        securities = conn.execute("SELECT * FROM securities").df()
+        value_rules = ValueRules(excluded_sector="Financials")
+        rules = CompositeRules(weights={"momentum": 0.5, "value": 0.5})
+
+        def score(p, as_of, universe):
+            z_mom = normalize_within_sector(
+                momentum_factor(p, as_of).reindex(universe.index), universe["sector"]
+            )
+            yields = compute_yields(conn, p, as_of, list(universe.index))
+            z_val = value_score(yields, universe["sector"], value_rules).reindex(
+                universe.index
+            )
+            return combine({"momentum": z_mom, "value": z_val}, rules)
+
+        result = run_backtest(
+            panel, securities, score_fn=score,
+            universe_rules=UniverseRules(),
+            portfolio_rules=PortfolioRules(top_n=6, buffer_rank=9, max_sector_weight=0.34),
+            cost_model=CostModel(),
+            start=START, end=END,
+        )
+    finally:
+        conn.close()
+
+    assert result.n_rebalances > 12
+    for weights in result.weights.values():
+        assert weights.sum() == pytest.approx(1.0)
+
+    # Композит не обязан покупать только дешёвые — половина балла идёт от импульса.
+    # Но склонность к дешёвым должна остаться заметной.
+    picked = [p for weights in result.weights.values() for p in weights.index]
+    share_cheap = sum(p in cheap for p in picked) / len(picked)
+    assert share_cheap > 0.5, f"доля дешёвых в портфеле {share_cheap:.0%}"
+
+
+def test_composite_differs_from_both_of_its_halves(db_with_reports):
+    """Если композит совпал с одной из половин, веса или сложение не работают."""
+    from factorbot.factors.composite import CompositeRules, combine
+    from factorbot.factors.momentum import momentum as momentum_factor
+    from factorbot.factors.value import ValueRules, compute_yields, value_score
+    from factorbot.normalize import normalize_within_sector
+
+    path, _ = db_with_reports
+    conn = duckdb.connect(str(path), read_only=True)
+    try:
+        panel = load_price_panel(conn)
+        securities = conn.execute("SELECT * FROM securities").df()
+        as_of = [d for d in panel.month_end_dates() if d >= START][3]
+        universe = __import__(
+            "factorbot.universe", fromlist=["build_universe"]
+        ).build_universe(panel, securities, as_of, UniverseRules())
+
+        z_mom = normalize_within_sector(
+            momentum_factor(panel, as_of).reindex(universe.index), universe["sector"]
+        )
+        yields = compute_yields(conn, panel, as_of, list(universe.index))
+        z_val = value_score(
+            yields, universe["sector"], ValueRules(excluded_sector="Financials")
+        ).reindex(universe.index)
+        mixed = combine(
+            {"momentum": z_mom, "value": z_val},
+            CompositeRules(weights={"momentum": 0.5, "value": 0.5}),
+        )
+    finally:
+        conn.close()
+
+    top_mixed = set(mixed.nlargest(6).index)
+    assert top_mixed != set(z_mom.nlargest(6).index)
+    assert top_mixed != set(z_val.nlargest(6).index)
