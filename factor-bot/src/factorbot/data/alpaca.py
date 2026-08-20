@@ -133,8 +133,20 @@ def build_alpaca_map(
     Бумаги, которых на Alpaca нет (OTC, отдельные классы акций), остаются в карте
     со значением tradable=False — их надо отсеивать осознанно и видеть в логе,
     а не терять на молчаливом inner join.
+
+    Делистингованные бумаги в карту не попадают вовсе, и это не оптимизация.
+    Символ ушедшей компании переиспользуется: `permaticker` 1001 с тикером AAA
+    мог перестать торговаться в 2005 году, а сегодняшний AAA на Alpaca — совсем
+    другая компания. Сопоставив их, мы получили бы карту, по которой заявка
+    уходит не в ту бумагу. Ровно от этого предостерегает ТЗ 4.5, и здесь ошибка
+    стоила бы денег, а не строчки в отчёте.
     """
-    left = securities[["permaticker", "ticker"]].copy()
+    live = securities.loc[~securities["is_delisted"].fillna(False).astype(bool)]
+    delisted = len(securities) - len(live)
+    if delisted:
+        log.info("Вне карты Alpaca: %d делистингованных бумаг (ТЗ 4.5)", delisted)
+
+    left = live[["permaticker", "ticker"]].copy()
     left["ticker"] = left["ticker"].astype("string").str.upper()
 
     right = assets.copy()

@@ -9,9 +9,9 @@ import pandas as pd
 from factorbot.data.alpaca import build_alpaca_map, reconcile_prices
 
 SECURITIES = pd.DataFrame([
-    {"permaticker": 1001, "ticker": "AAA"},
-    {"permaticker": 1002, "ticker": "BBB"},
-    {"permaticker": 1003, "ticker": "OTCX"},   # на Alpaca отсутствует
+    {"permaticker": 1001, "ticker": "AAA", "is_delisted": False},
+    {"permaticker": 1002, "ticker": "BBB", "is_delisted": False},
+    {"permaticker": 1003, "ticker": "OTCX", "is_delisted": False},  # нет на Alpaca
 ])
 
 ASSETS = pd.DataFrame([
@@ -86,3 +86,16 @@ def test_no_overlap_returns_empty_frame_with_the_diff_column():
     out = reconcile_prices(_sep([10.0, 11.0]), empty, MAP)
     assert out.empty
     assert "rel_diff" in out.columns
+
+
+def test_delisted_securities_are_left_out_of_the_map():
+    """Освободившийся тикер достаётся другой компании: сопоставив ушедшую бумагу
+    с живым символом, мы получили бы карту, по которой заявка уходит не туда."""
+    securities = pd.concat([
+        SECURITIES,
+        pd.DataFrame([{"permaticker": 9001, "ticker": "AAA", "is_delisted": True}]),
+    ], ignore_index=True)
+
+    m = build_alpaca_map(securities, ASSETS, checked_at=date(2024, 1, 2))
+    assert 9001 not in set(m["permaticker"])
+    assert 1001 in set(m["permaticker"])
