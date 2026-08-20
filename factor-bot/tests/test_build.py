@@ -206,7 +206,20 @@ def test_subscription_refusal_does_not_stop_the_probe(monkeypatch):
     assert not any(a.ok for a in access.values())
 
 
-def test_probe_without_a_key_says_so_instead_of_calling_out():
+def test_probe_without_a_key_says_so_instead_of_calling_out(monkeypatch):
+    """Без ключа проверка обязана вернуть отказ, а не пойти в сеть.
+
+    Пустая строка в конструкторе — не гарантия: провайдер подставляет ключ из
+    окружения. Раньше этот тест делал настоящий запрос к поставщику боевым
+    ключом и расходовал его лимит.
+    """
+    monkeypatch.delenv("NASDAQ_DATA_LINK_API_KEY", raising=False)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("тест без ключа не имеет права ходить в сеть")
+
+    monkeypatch.setattr(sharadar.requests, "get", forbidden)
+
     provider = sharadar.SharadarProvider(api_key="", probe_interval_s=0)
     state = provider.probe_table("SEP")
     assert not state.ok

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -77,3 +78,28 @@ def pit_conn() -> duckdb.DuckDBPyConnection:
     conn.executemany(INSERT_SQL, ROWS)
     yield conn
     conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Изоляция окружения
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def isolated_environment(monkeypatch):
+    """Ни один тест не видит боевых ключей и не ходит с ними в сеть.
+
+    Провайдеры по умолчанию берут ключ из окружения, поэтому тест, создавший
+    клиент «без ключа», незаметно превращался в живой запрос к поставщику — с
+    настоящим ключом, расходуя его лимит. Один такой тест уже успел это сделать.
+
+    Заодно `os.environ` подменяется копией: `load_dotenv` пишет в него напрямую,
+    и без копии переменная, выставленная одним тестом, доживала до конца прогона
+    и меняла поведение следующих.
+    """
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    for key in (
+        "NASDAQ_DATA_LINK_API_KEY", "ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY",
+        "FACTORBOT_UNLOCK_HOLDOUT",
+    ):
+        os.environ.pop(key, None)
