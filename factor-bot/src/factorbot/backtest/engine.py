@@ -59,6 +59,20 @@ class BacktestResult:
     delisted_hits: int = 0
     #: Даты ребалансировки, на которых сработал режимный фильтр (ТЗ 7.1).
     risk_off_dates: list[pd.Timestamp] = field(default_factory=list)
+    #: Состав вселенной на каждую дату сигнала — для таблицы `universe` (ТЗ 4.7).
+    universe_members: dict[pd.Timestamp, pd.Index] = field(default_factory=dict)
+    #: Число сделок на каждой ребалансировке (ТЗ 10).
+    trades: pd.Series = field(default_factory=lambda: pd.Series(dtype="int64"))
+
+    @property
+    def n_trades(self) -> int:
+        """Всего сделок за прогон (ТЗ 10).
+
+        Сделкой считается любое изменение веса бумаги: и вход, и выход, и
+        доведение доли до целевой. Именно за них платятся издержки ТЗ 8, поэтому
+        считать иначе значило бы отчитываться не о том, что оплачено.
+        """
+        return int(self.trades.sum())
 
     @property
     def risk_off_share(self) -> float:
@@ -159,6 +173,8 @@ def run_backtest(
     turnover_log: dict[pd.Timestamp, float] = {}
     costs_log: dict[pd.Timestamp, float] = {}
     universe_log: dict[pd.Timestamp, int] = {}
+    universe_members: dict[pd.Timestamp, pd.Index] = {}
+    trades_log: dict[pd.Timestamp, int] = {}
     delisted_hits = 0
     risk_off_dates: list[pd.Timestamp] = []
 
@@ -185,13 +201,16 @@ def run_backtest(
 
             target: pd.Series | None = None
             if risk_off:
+                # Вселенная в защитном режиме не считается вовсе. Записать сюда
+                # ноль значило бы сказать «к покупке ничего не было доступно» —
+                # неправда, и она портит медиану размера вселенной в отчёте.
                 risk_off_dates.append(signal_day)
-                universe_log[signal_day] = 0
                 target = regime.risk_off_weights(today)
                 target = _tradable_at_execution_weights(target, last_alive, today)
             else:
                 universe = build_universe(panel, securities, signal_day, universe_rules)
                 universe_log[signal_day] = len(universe)
+                universe_members[signal_day] = universe.index
                 if len(universe) == 0:
                     # До первой покупки это разогрев, а не сбой: истории цен нет.
                     report = log.info if not invested else log.warning
@@ -218,6 +237,7 @@ def run_backtest(
                 )
                 cost = rebalance_cost(current, target, liquidity, cost_model)
                 turnover_log[today] = turnover(current, target)
+                trades_log[today] = _count_trades(current, target)
                 costs_log[today] = cost
                 weights_log[today] = target
 
@@ -253,6 +273,8 @@ def run_backtest(
         universe_size=pd.Series(universe_log, name="universe_size").sort_index(),
         delisted_hits=delisted_hits,
         risk_off_dates=risk_off_dates,
+        universe_members=universe_members,
+        trades=pd.Series(trades_log, name="trades", dtype="int64").sort_index(),
     )
 
 
@@ -278,6 +300,17 @@ def _tradable_at_execution(
             len(selected) - len(alive),
         )
     return pd.Index(alive, name="permaticker")
+
+
+def _count_trades(before: pd.Series, after: pd.Series) -> int:
+    """Сколько бумаг сменили вес на этой ребалансировке.
+
+    Порог в одну сотую процентного пункта отсекает численный шум: доля 1/30
+    после переоценки редко получается точно такой же, но сделкой это не является.
+    """
+    names = before.index.union(after.index)
+    changes = after.reindex(names).fillna(0.0) - before.reindex(names).fillna(0.0)
+    return int((changes.abs() > 1e-6).sum())
 
 
 def _tradable_at_execution_weights(

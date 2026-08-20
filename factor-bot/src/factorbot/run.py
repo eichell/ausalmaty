@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 
 from factorbot.backtest.costs import CostModel
@@ -27,7 +28,7 @@ from factorbot.backtest.delisting import build_delisting_returns
 from factorbot.backtest.engine import run_backtest
 from factorbot.config import load_config, load_dotenv
 from factorbot.data.panel import load_price_panel
-from factorbot.data.periods import PERIODS, open_period
+from factorbot.data.periods import PERIODS, open_period, period_path
 from factorbot.factors.composite import CompositeRules, combine
 from factorbot.factors.momentum import momentum
 from factorbot.factors.value import ValueRules, compute_yields, value_score
@@ -195,11 +196,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--strategy", default="momentum", choices=sorted(STRATEGIES))
     parser.add_argument("--period", default="in_sample", choices=sorted(PERIODS))
     parser.add_argument("--note", default="", help="что изменено в этом прогоне (ТЗ 9.2.1)")
+    parser.add_argument("--capital", type=float, default=None,
+                        help="предполагаемый размер капитала для отчёта (ТЗ 8)")
     parser.add_argument(
         "--regime", default="config", choices=["config", "on", "off", "both"],
         help="режимный фильтр ТЗ 7.1; both прогоняет обе версии рядом",
     )
     parser.add_argument("--plots", action="store_true", help="сохранить графики")
+    parser.add_argument("--save-universe", action="store_true",
+                        help="записать состав вселенной по датам в таблицу universe (ТЗ 4.7)")
+    parser.add_argument("--decompose", action="store_true",
+                        help="разложение вклада: momentum, value и композит рядом (ТЗ 10)")
     parser.add_argument("--out", default="data/processed/report")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -210,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     load_dotenv()
     cfg = load_config(args.config)
+    if args.capital is None:
+        args.capital = cfg.costs.assumed_capital_usd
 
     base = RegimeRules.from_config(cfg.regime_filter)
     wanted = {
@@ -235,6 +244,12 @@ def main(argv: list[str] | None = None) -> int:
     if len(results) > 1:
         _print_regime_comparison(results, benchmark)
 
+    if args.decompose:
+        _print_decomposition(cfg, args, benchmark)
+
+    if args.save_universe:
+        _save_universe(cfg, args.period, primary)
+
     append_experiment(
         args.note, f"{args.strategy}{'+filter' if wanted[-1] else ''}", args.period,
         f"CAGR {net.cagr:.2%} (до издержек {gross.cagr:.2%}), Sharpe {net.sharpe:.2f}, "
@@ -256,6 +271,58 @@ def main(argv: list[str] | None = None) -> int:
         log.info("Графики: %s", out)
 
     return 0
+
+
+def _save_universe(cfg, period_name: str, result) -> None:
+    """Пишет состав вселенной в базу периода (ТЗ 4.7).
+
+    Отдельным шагом после прогона: база периода открывается на чтение, и держать
+    её открытой на запись весь бэктест незачем.
+    """
+    from factorbot.universe import save_universe
+
+    path = period_path(cfg.data.processed_dir, period_name)
+    conn = duckdb.connect(str(path))
+    try:
+        save_universe(conn, result.universe_members)
+    finally:
+        conn.close()
+
+
+def _print_decomposition(cfg, args, benchmark) -> None:
+    """Разложение вклада: momentum отдельно, value отдельно, композит (ТЗ 10).
+
+    Композит, который не лучше лучшей из своих половин, — повод не радоваться
+    результату, а спросить, зачем в нём вторая половина.
+    """
+    context = open_run_context(cfg, args.period)
+    try:
+        parts = {
+            name: M.summarize(execute(context, name), benchmark)
+            for name in ("momentum", "value", "composite")
+        }
+    finally:
+        context.close()
+
+    print("\n=== разложение вклада (ТЗ 10) ===")
+    print(f"{'':24}{'momentum':>14}{'value':>14}{'композит':>14}")
+    for label, attr, fmt in [
+        ("CAGR", "cagr", "{:.2%}"),
+        ("Волатильность", "volatility", "{:.2%}"),
+        ("Sharpe", "sharpe", "{:.2f}"),
+        ("Макс. просадка", "max_drawdown", "{:.1%}"),
+        ("Оборот в год", "annual_turnover", "{:.0%}"),
+    ]:
+        row = "".join(f"{fmt.format(getattr(parts[n], attr)):>14}"
+                      for n in ("momentum", "value", "composite"))
+        print(f"{label:<24}{row}")
+
+    best_half = max(parts["momentum"].sharpe, parts["value"].sharpe)
+    if parts["composite"].sharpe < best_half:
+        print(
+            "\n[!] Композит хуже лучшей из своих половин. Это не обязательно "
+            "ошибка, но повод спросить, зачем в нём вторая половина."
+        )
 
 
 def _print_regime_comparison(results: dict[bool, object], benchmark) -> None:
@@ -285,8 +352,19 @@ def _print_report(args, result, net: M.Metrics, gross: M.Metrics, benchmark,
     print(f"Период:                  {result.equity_net.index[0].date()} — "
           f"{result.equity_net.index[-1].date()}  ({net.years:.1f} лет)")
     print(f"Ребалансировок:          {net.n_rebalances}")
-    print(f"Вселенная (медиана):     {int(result.universe_size.median())} бумаг")
+    sizes = result.universe_size
+    if len(sizes):
+        # Медиана считается по датам, где вселенная непуста. Пустые даты — это
+        # разогрев (нужно 14 месяцев истории, ТЗ 5), и усреднять их с рабочими
+        # значит показывать читателю не размер вселенной, а долю разогрева.
+        filled = sizes.loc[sizes > 0]
+        empty = len(sizes) - len(filled)
+        note = f", пусто на {empty}" if empty else ""
+        median = int(filled.median()) if len(filled) else 0
+        print(f"Вселенная (медиана):     {median} бумаг  "
+              f"(отбор на {len(filled)} датах{note})")
     print(f"Делистингов в портфеле:  {result.delisted_hits}")
+    print(f"Сделок:                  {result.n_trades}")
     if filtered:
         print(f"Ребалансировок в защите: {len(result.risk_off_dates)} "
               f"({result.risk_off_share:.0%})")
@@ -307,6 +385,13 @@ def _print_report(args, result, net: M.Metrics, gross: M.Metrics, benchmark,
         print(f"Отставание от {benchmark.name}, мес.: {net.max_underperformance_months:.0f}")
     print(f"Оборот:                  {net.annual_turnover:.0%} в год")
     print(f"Средний срок удержания:  {net.average_holding_months:.1f} мес.")
+    # ТЗ 8: влияние на цену не моделируется, и допущение живёт только на этом
+    # размере капитала. Без цифры в отчёте читатель об этом не узнает.
+    capital = float(args.capital)
+    print(f"\nДопущение о капитале:    ${capital:,.0f}".replace(",", " "))
+    if capital > 10_000_000:
+        print("[!] Выше $10 млн допущение об отсутствии влияния на цену "
+              "перестаёт работать (ТЗ 8): результат оптимистичен.")
 
     yearly = M.yearly_returns(result.equity_net, benchmark)
     print("\nПо годам:")

@@ -115,3 +115,63 @@ def test_non_trading_date_is_an_error_not_a_silent_empty_result():
     panel = _flat_panel([1001])
     with pytest.raises(ValueError, match="не торговый день"):
         build_universe(panel, make_securities([1001]), pd.Timestamp("2003-01-05"), RULES)
+
+
+# --------------------------------------------------------------------------- #
+# Запись состава в базу (ТЗ 4.7)
+# --------------------------------------------------------------------------- #
+
+
+def test_universe_is_written_with_one_row_per_date_and_name():
+    import duckdb
+
+    from factorbot.data.schema import create_all
+    from factorbot.universe import save_universe
+
+    conn = duckdb.connect(":memory:")
+    create_all(conn)
+    try:
+        members = {
+            pd.Timestamp("2005-06-30"): pd.Index([1, 2, 3]),
+            pd.Timestamp("2005-07-29"): pd.Index([2, 3]),
+        }
+        assert save_universe(conn, members) == 5
+        stored = conn.execute("SELECT count(*) FROM universe").fetchone()[0]
+        assert stored == 5
+    finally:
+        conn.close()
+
+
+def test_rewriting_replaces_the_previous_run():
+    """Иначе в таблице смешаются прогоны с разными порогами, и она перестанет
+    соответствовать хоть какому-нибудь одному из них."""
+    import duckdb
+
+    from factorbot.data.schema import create_all
+    from factorbot.universe import save_universe
+
+    conn = duckdb.connect(":memory:")
+    create_all(conn)
+    try:
+        save_universe(conn, {pd.Timestamp("2005-06-30"): pd.Index([1, 2, 3])})
+        save_universe(conn, {pd.Timestamp("2005-06-30"): pd.Index([9])})
+        stored = conn.execute("SELECT permaticker FROM universe").df()
+        assert list(stored["permaticker"]) == [9]
+    finally:
+        conn.close()
+
+
+def test_empty_universe_writes_nothing(caplog):
+    import duckdb
+
+    from factorbot.data.schema import create_all
+    from factorbot.universe import save_universe
+
+    conn = duckdb.connect(":memory:")
+    create_all(conn)
+    try:
+        with caplog.at_level("WARNING"):
+            assert save_universe(conn, {}) == 0
+    finally:
+        conn.close()
+    assert any("записывать нечего" in r.getMessage() for r in caplog.records)

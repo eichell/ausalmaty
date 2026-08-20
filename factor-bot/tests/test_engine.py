@@ -252,3 +252,51 @@ def test_delisting_warning_actually_renders(caplog):
 
     messages = [r.getMessage() for r in caplog.records]
     assert any("−100%" in m and "ТЗ 4.1" in m for m in messages)
+
+
+# --------------------------------------------------------------------------- #
+# Учёт для отчёта (ТЗ 10, 4.7)
+# --------------------------------------------------------------------------- #
+
+
+def test_first_rebalance_counts_every_purchase_as_a_trade():
+    panel = make_panel({p: [50.0] * len(DAYS) for p in (1, 2)}, DAYS)
+    result = run(panel, make_securities([1, 2]), ranking={1: 2, 2: 1})
+    first = result.trades.index[0]
+    assert result.trades.loc[first] == 2
+
+
+def test_unchanged_portfolio_makes_no_trades():
+    """Иначе число сделок распухнет на численном шуме переоценки весов."""
+    panel = make_panel({p: [50.0] * len(DAYS) for p in (1, 2)}, DAYS)
+    result = run(panel, make_securities([1, 2]), ranking={1: 2, 2: 1})
+    assert result.trades.iloc[1:].sum() == 0
+    assert result.n_trades == 2
+
+
+def test_swapping_a_name_counts_as_two_trades():
+    """Продать одну и купить другую — две сделки, и обе оплачены (ТЗ 8)."""
+    switch = DAYS.get_loc(pd.Timestamp("2005-09-01"))
+    rising = [50.0] * switch + [50.0 + i for i in range(len(DAYS) - switch)]
+    panel = make_panel({1: [50.0] * len(DAYS), 2: rising}, DAYS)
+
+    result = run_backtest(
+        panel, make_securities([1, 2]),
+        score_fn=lambda p, d, u: panel.closeadj.loc[d].reindex(u.index),
+        universe_rules=UNIVERSE,
+        portfolio_rules=PortfolioRules(top_n=1, buffer_rank=1, max_sector_weight=1.0),
+        cost_model=NO_COSTS, start=START, end=END,
+    )
+    assert result.n_trades > 2
+
+
+def test_universe_membership_is_recorded_for_every_signal_date():
+    """Без состава вселенной нельзя ответить, почему бумага не куплена: балл
+    низкий или её вообще не было в отборе (ТЗ 4.7)."""
+    panel = make_panel({p: [50.0] * len(DAYS) for p in (1, 2, 3)}, DAYS)
+    result = run(panel, make_securities([1, 2, 3]), ranking={1: 3, 2: 2, 3: 1})
+
+    assert set(result.universe_members) == set(result.universe_size.index)
+    for day, members in result.universe_members.items():
+        assert len(members) == result.universe_size.loc[day]
+        assert set(members) <= {1, 2, 3}

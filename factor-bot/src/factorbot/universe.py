@@ -144,3 +144,41 @@ def _empty_universe() -> pd.DataFrame:
     })
     out.index.name = "permaticker"
     return out
+
+
+def save_universe(
+    conn, members: dict[pd.Timestamp, pd.Index], *, replace: bool = True
+) -> int:
+    """Сохраняет состав вселенной по датам в таблицу `universe` (ТЗ 4.7).
+
+    Вселенная считается на лету при каждом прогоне, и без записи невозможно
+    ответить на вопрос «что вообще было доступно к покупке 30 июня 2007 года».
+    А это первый вопрос при разборе любой странной сделки: бумага не куплена
+    потому, что балл низкий, или потому, что её не было во вселенной вовсе.
+
+    Args:
+        replace: очистить таблицу перед записью. Иначе останутся строки прошлого
+            прогона с другими порогами, и таблица перестанет соответствовать
+            какому-либо одному прогону.
+
+    Returns:
+        Число записанных строк.
+    """
+    rows = [
+        {"date": day.date() if hasattr(day, "date") else day, "permaticker": int(p)}
+        for day, index in members.items()
+        for p in index
+    ]
+    if not rows:
+        log.warning("Вселенная пуста на всех датах: записывать нечего")
+        return 0
+
+    if replace:
+        conn.execute("DELETE FROM universe")
+
+    frame = pd.DataFrame(rows).drop_duplicates()
+    conn.register("_universe", frame)
+    conn.execute("INSERT OR REPLACE INTO universe SELECT * FROM _universe")
+    conn.unregister("_universe")
+    log.info("Записано в universe: %d строк на %d дат", len(frame), len(members))
+    return len(frame)
