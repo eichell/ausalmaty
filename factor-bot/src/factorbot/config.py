@@ -90,6 +90,39 @@ class Section(Mapping):
     def __repr__(self) -> str:
         return f"Section({sorted(self._data)})"
 
+    def to_dict(self) -> dict[str, Any]:
+        """Обратно в обычные словари — чтобы конфиг можно было менять копией."""
+        return {
+            k: v.to_dict() if isinstance(v, Section) else v
+            for k, v in self._data.items()
+        }
+
+
+def with_overrides(cfg: Section, overrides: Mapping[str, Any]) -> Section:
+    """Копия конфига с изменёнными параметрами. Ключи вида `portfolio.top_n`.
+
+    Карта чувствительности (ТЗ 9.2.2) — это по сути прогон с одним изменённым
+    параметром, и менять его надо там же, где он задан, а не подсовывать в обход
+    конфига. Иначе прогон нельзя воспроизвести по записи в журнале испытаний.
+
+    Raises:
+        KeyError: если такого параметра в конфиге нет. Опечатка в пути обязана
+            падать: молча созданный новый ключ ничего бы не изменил в прогоне,
+            и карта показывала бы плоскую линию вместо чувствительности.
+    """
+    raw = cfg.to_dict()
+    for path, value in overrides.items():
+        parts = path.split(".")
+        node = raw
+        for part in parts[:-1]:
+            if part not in node or not isinstance(node[part], dict):
+                raise KeyError(f"В конфиге нет секции {part!r} (путь {path!r})")
+            node = node[part]
+        if parts[-1] not in node:
+            raise KeyError(f"В конфиге нет параметра {path!r}")
+        node[parts[-1]] = value
+    return Section(raw)
+
 
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> Section:
     """Читает и проверяет конфиг стратегии.

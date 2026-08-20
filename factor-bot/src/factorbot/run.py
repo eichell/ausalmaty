@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 
@@ -97,6 +97,70 @@ def composite(cfg, conn):
 STRATEGIES = {"momentum": momentum_only, "value": value_only, "composite": composite}
 
 
+@dataclass
+class RunContext:
+    """Всё, что нужно для прогона, загруженное один раз.
+
+    Соединение остаётся открытым: value читает фундаментал на каждой дате
+    ребалансировки (ТЗ 4.8). Закрывать обязан вызывающий.
+    """
+
+    cfg: object
+    period: object
+    panel: object
+    securities: pd.DataFrame
+    benchmark: pd.Series
+    delisting: pd.Series
+    conn: object
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def open_run_context(cfg, period_name: str) -> RunContext:
+    """Открывает базу периода и загружает всё общее для любых прогонов."""
+    period = PERIODS[period_name]
+    conn = open_period(period_name, cfg.data.processed_dir)
+    try:
+        panel = load_price_panel(conn, end=period.end)
+        securities = conn.execute("SELECT * FROM securities").df()
+        corp_actions = conn.execute("SELECT * FROM corp_actions").df()
+        benchmark = load_benchmark(conn, cfg.reporting.benchmark)
+        last_prices = (
+            panel.closeadj.ffill().iloc[-1] if len(panel.closeadj) else pd.Series()
+        )
+        delisting = build_delisting_returns(securities, corp_actions, last_prices)
+    except Exception:
+        conn.close()
+        raise
+    return RunContext(cfg, period, panel, securities, benchmark, delisting, conn)
+
+
+def execute(context: RunContext, strategy: str, *, regime_enabled: bool | None = None,
+            score_wrapper=None):
+    """Один прогон бэктеста в уже открытом контексте."""
+    cfg = context.cfg
+    rules = RegimeRules.from_config(cfg.regime_filter)
+    if regime_enabled is not None:
+        rules = replace(rules, enabled=regime_enabled)
+
+    score_fn = STRATEGIES[strategy](cfg, context.conn)
+    if score_wrapper is not None:
+        score_fn = score_wrapper(score_fn)
+
+    return run_backtest(
+        context.panel, context.securities,
+        score_fn=score_fn,
+        universe_rules=UniverseRules.from_config(cfg.universe),
+        portfolio_rules=PortfolioRules.from_config(cfg.portfolio),
+        cost_model=CostModel.from_config(cfg.costs),
+        start=context.period.start,
+        end=min(context.period.end, date.today()),
+        delisting_returns=context.delisting,
+        regime=build_regime_filter(context.panel, context.securities, rules),
+    )
+
+
 def load_benchmark(conn, ticker: str) -> pd.Series:
     """Дневная кривая бенчмарка из тех же цен. Пусто, если бумаги нет в базе."""
     df = conn.execute(
@@ -146,41 +210,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     load_dotenv()
     cfg = load_config(args.config)
-    period = PERIODS[args.period]
 
-    # Соединение живёт весь прогон: value читает фундаментал на каждой дате
-    # ребалансировки, и закрывать базу до конца бэктеста нельзя.
-    conn = open_period(args.period, cfg.data.processed_dir)
+    base = RegimeRules.from_config(cfg.regime_filter)
+    wanted = {
+        "config": [base.enabled], "on": [True], "off": [False], "both": [False, True],
+    }[args.regime]
+
+    context = open_run_context(cfg, args.period)
     try:
-        panel = load_price_panel(conn, end=period.end)
-        securities = conn.execute("SELECT * FROM securities").df()
-        corp_actions = conn.execute("SELECT * FROM corp_actions").df()
-        benchmark = load_benchmark(conn, cfg.reporting.benchmark)
-
-        last_prices = panel.closeadj.ffill().iloc[-1] if len(panel.closeadj) else pd.Series()
-        delisting = build_delisting_returns(securities, corp_actions, last_prices)
-
-        base = RegimeRules.from_config(cfg.regime_filter)
-        wanted = {
-            "config": [base.enabled], "on": [True], "off": [False], "both": [False, True],
-        }[args.regime]
-
-        results = {}
-        for enabled in wanted:
-            rules = replace(base, enabled=enabled)
-            results[enabled] = run_backtest(
-                panel, securities,
-                score_fn=STRATEGIES[args.strategy](cfg, conn),
-                universe_rules=UniverseRules.from_config(cfg.universe),
-                portfolio_rules=PortfolioRules.from_config(cfg.portfolio),
-                cost_model=CostModel.from_config(cfg.costs),
-                start=period.start,
-                end=min(period.end, date.today()),
-                delisting_returns=delisting,
-                regime=build_regime_filter(panel, securities, rules),
-            )
+        benchmark = context.benchmark
+        results = {
+            enabled: execute(context, args.strategy, regime_enabled=enabled)
+            for enabled in wanted
+        }
     finally:
-        conn.close()
+        context.close()
 
     primary = results[wanted[-1]]
     result = primary
