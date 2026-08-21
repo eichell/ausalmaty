@@ -20,7 +20,7 @@ DEFAULT_ENV_PATH = Path(".env")
 
 REQUIRED_SECTIONS = (
     "data", "periods", "universe", "factors", "portfolio", "regime_filter",
-    "costs", "reporting",
+    "risk", "costs", "reporting",
 )
 
 

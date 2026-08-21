@@ -36,6 +36,7 @@ from factorbot.normalize import normalize_within_sector
 from factorbot.portfolio import PortfolioRules
 from factorbot.regime import RegimeRules, build_regime_filter
 from factorbot.report import metrics as M
+from factorbot.risk import PositionLimits, StopLossRules, TradeThrottle
 from factorbot.universe import UniverseRules
 
 log = logging.getLogger("factorbot.run")
@@ -138,12 +139,16 @@ def open_run_context(cfg, period_name: str) -> RunContext:
 
 
 def execute(context: RunContext, strategy: str, *, regime_enabled: bool | None = None,
-            score_wrapper=None):
+            stops_enabled: bool | None = None, score_wrapper=None):
     """Один прогон бэктеста в уже открытом контексте."""
     cfg = context.cfg
     rules = RegimeRules.from_config(cfg.regime_filter)
     if regime_enabled is not None:
         rules = replace(rules, enabled=regime_enabled)
+
+    stop_rules = StopLossRules.from_config(cfg.risk.stop_loss)
+    if stops_enabled is not None:
+        stop_rules = replace(stop_rules, enabled=stops_enabled)
 
     score_fn = STRATEGIES[strategy](cfg, context.conn)
     if score_wrapper is not None:
@@ -159,6 +164,9 @@ def execute(context: RunContext, strategy: str, *, regime_enabled: bool | None =
         end=min(context.period.end, date.today()),
         delisting_returns=context.delisting,
         regime=build_regime_filter(context.panel, context.securities, rules),
+        stop_rules=stop_rules,
+        limits=PositionLimits.from_config(cfg.risk),
+        throttle=TradeThrottle.from_config(cfg.risk),
     )
 
 
@@ -202,6 +210,10 @@ def main(argv: list[str] | None = None) -> int:
         "--regime", default="config", choices=["config", "on", "off", "both"],
         help="режимный фильтр ТЗ 7.1; both прогоняет обе версии рядом",
     )
+    parser.add_argument(
+        "--stops", default="config", choices=["config", "on", "off", "both"],
+        help="стоп-лосс (вне ТЗ); both прогоняет обе версии рядом",
+    )
     parser.add_argument("--plots", action="store_true", help="сохранить графики")
     parser.add_argument("--save-universe", action="store_true",
                         help="записать состав вселенной по датам в таблицу universe (ТЗ 4.7)")
@@ -225,13 +237,27 @@ def main(argv: list[str] | None = None) -> int:
         "config": [base.enabled], "on": [True], "off": [False], "both": [False, True],
     }[args.regime]
 
+    base_stops = StopLossRules.from_config(cfg.risk.stop_loss)
+    stop_variants = {
+        "config": [base_stops.enabled], "on": [True], "off": [False],
+        "both": [False, True],
+    }[args.stops]
+
     context = open_run_context(cfg, args.period)
     try:
         benchmark = context.benchmark
         results = {
-            enabled: execute(context, args.strategy, regime_enabled=enabled)
+            enabled: execute(context, args.strategy, regime_enabled=enabled,
+                             stops_enabled=stop_variants[-1])
             for enabled in wanted
         }
+        stop_results = {}
+        if len(stop_variants) > 1:
+            stop_results = {
+                enabled: execute(context, args.strategy,
+                                 regime_enabled=wanted[-1], stops_enabled=enabled)
+                for enabled in stop_variants
+            }
     finally:
         context.close()
 
@@ -243,6 +269,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if len(results) > 1:
         _print_regime_comparison(results, benchmark)
+
+    if stop_results:
+        _print_stop_comparison(stop_results, benchmark)
 
     if args.decompose:
         _print_decomposition(cfg, args, benchmark)
@@ -325,6 +354,29 @@ def _print_decomposition(cfg, args, benchmark) -> None:
         )
 
 
+def _print_stop_comparison(results: dict[bool, object], benchmark) -> None:
+    """Стоп-лосса нет в ТЗ, поэтому сравнение с версией без него обязательно.
+
+    Тот же принцип, что ТЗ 7.1 задаёт для режимного фильтра: защита, которую не
+    сравнивали с её отсутствием, — лишний параметр, а не защита.
+    """
+    off, on = M.summarize(results[False], benchmark), M.summarize(results[True], benchmark)
+    print("\n=== стоп-лосс: с ним и без него (вне ТЗ) ===")
+    print(f"{'':28}{'без стопов':>14}{'со стопами':>14}")
+    for label, attr, fmt in [
+        ("CAGR", "cagr", "{:.2%}"),
+        ("Волатильность", "volatility", "{:.2%}"),
+        ("Sharpe", "sharpe", "{:.2f}"),
+        ("Макс. просадка", "max_drawdown", "{:.1%}"),
+        ("Оборот в год", "annual_turnover", "{:.0%}"),
+    ]:
+        print(f"{label:<28}{fmt.format(getattr(off, attr)):>14}"
+              f"{fmt.format(getattr(on, attr)):>14}")
+    print(f"{'Сработало стопов':<28}{'—':>14}{results[True].n_stops:>14}")
+    if results[True].throttled:
+        print(f"{'Отложено ограничителем':<28}{'—':>14}{results[True].throttled:>14}")
+
+
 def _print_regime_comparison(results: dict[bool, object], benchmark) -> None:
     """ТЗ 7.1: результаты с фильтром обязательно сравнить с версией без него."""
     off, on = M.summarize(results[False], benchmark), M.summarize(results[True], benchmark)
@@ -365,6 +417,8 @@ def _print_report(args, result, net: M.Metrics, gross: M.Metrics, benchmark,
               f"(отбор на {len(filled)} датах{note})")
     print(f"Делистингов в портфеле:  {result.delisted_hits}")
     print(f"Сделок:                  {result.n_trades}")
+    if result.n_stops:
+        print(f"Сработало стоп-лоссов:   {result.n_stops}")
     if filtered:
         print(f"Ребалансировок в защите: {len(result.risk_off_dates)} "
               f"({result.risk_off_share:.0%})")

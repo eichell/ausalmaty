@@ -41,6 +41,7 @@ from factorbot.backtest.delisting import DEFAULT_DELISTING_RETURN
 from factorbot.data.panel import PricePanel
 from factorbot.portfolio import PortfolioRules, equal_weights, select_portfolio
 from factorbot.regime import RegimeFilter
+from factorbot.risk import PositionLimits, StopLossRules, TradeThrottle
 from factorbot.universe import UniverseRules, build_universe
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,14 @@ class BacktestResult:
     universe_members: dict[pd.Timestamp, pd.Index] = field(default_factory=dict)
     #: Число сделок на каждой ребалансировке (ТЗ 10).
     trades: pd.Series = field(default_factory=lambda: pd.Series(dtype="int64"))
+    #: Сработавшие стоп-лоссы: (дата исполнения, permaticker). Вне ТЗ.
+    stops: list[tuple[pd.Timestamp, int]] = field(default_factory=list)
+    #: Сколько раз ограничитель откладывал стоп-выход.
+    throttled: int = 0
+
+    @property
+    def n_stops(self) -> int:
+        return len(self.stops)
 
     @property
     def n_trades(self) -> int:
@@ -120,6 +129,9 @@ def run_backtest(
     end: date | pd.Timestamp,
     delisting_returns: pd.Series | None = None,
     regime: RegimeFilter | None = None,
+    stop_rules: StopLossRules | None = None,
+    limits: PositionLimits | None = None,
+    throttle: TradeThrottle | None = None,
 ) -> BacktestResult:
     """Прогоняет стратегию на панели цен.
 
@@ -133,6 +145,10 @@ def run_backtest(
             для всех (ТЗ 4.1).
         regime: режимный фильтр (ТЗ 7.1). None означает прогон без фильтра —
             именно с ним ТЗ требует сравнивать версию с фильтром.
+        stop_rules: стоп-лосс. Вне ТЗ, по умолчанию выключен; результат обязан
+            сравниваться с версией без него.
+        limits: лимит на долю одной бумаги.
+        throttle: ограничитель числа стоп-выходов за неделю.
     """
     start, end = pd.Timestamp(start), pd.Timestamp(end)
     if panel.trading_days.empty:
@@ -141,6 +157,9 @@ def run_backtest(
     delisting_returns = (
         pd.Series(dtype="float64") if delisting_returns is None else delisting_returns
     )
+    stop_rules = stop_rules or StopLossRules()
+    limits = limits or PositionLimits()
+    throttle = throttle or TradeThrottle()
     closeadj = panel.closeadj.ffill()
     last_alive = panel.closeadj.apply(lambda col: col.last_valid_index())
 
@@ -178,21 +197,44 @@ def run_backtest(
     delisted_hits = 0
     risk_off_dates: list[pd.Timestamp] = []
 
+    # Состояние стоп-лосса. entries — цена входа по каждой открытой позиции,
+    # pending — то, что пробило стоп вчера и продаётся сегодня по открытию.
+    entries: dict[int, float] = {}
+    pending_stops: set[int] = set()
+    quarantine: dict[int, pd.Timestamp] = {}
+    stop_history: list[pd.Timestamp] = []
+    stops_log: list[tuple[pd.Timestamp, int]] = []
+    throttled = 0
+
     previous_day: pd.Timestamp | None = None
     recorded: list[pd.Timestamp] = []
     invested = False
 
     for today in days:
+        # Цена открытия нужна в двух случаях: ребалансировка и исполнение стопов,
+        # пробитых вчера. В остальные дни хватает переоценки от закрытия к закрытию.
+        priced_at_open = today in schedule or bool(pending_stops)
+
         if previous_day is not None:
-            if today in schedule:
-                positions = _revalue(positions, closeadj, panel.openadj, previous_day, today)
-            else:
-                positions = _revalue(positions, closeadj, closeadj, previous_day, today)
+            to_prices = panel.openadj if priced_at_open else closeadj
+            positions = _revalue(positions, closeadj, to_prices, previous_day, today)
 
             positions, cash, hits = _settle_delistings(
                 positions, cash, last_alive, today, delisting_returns
             )
             delisted_hits += hits
+
+            if pending_stops:
+                positions, cash, executed, deferred = _execute_stops(
+                    positions, cash, pending_stops, throttle, stop_history, today,
+                )
+                for permaticker in executed:
+                    entries.pop(permaticker, None)
+                    quarantine[permaticker] = stop_rules.quarantine_until(today)
+                    stop_history.append(today)
+                    stops_log.append((today, permaticker))
+                throttled += len(deferred)
+                pending_stops = deferred
 
         if today in schedule:
             signal_day = schedule[today]
@@ -217,12 +259,23 @@ def run_backtest(
                     report("%s: вселенная пуста, портфель не меняется", signal_day.date())
                 else:
                     scores = score_fn(panel, signal_day, universe)
+                    # Выбывшие по стопу не рассматриваются, пока идёт карантин.
+                    # Убираются до отбора, а не после: иначе портфель просто
+                    # недосчитается позиций вместо того, чтобы взять следующих.
+                    #
+                    # Срок сверяется с днём сигнала, а не исполнения. Разница в
+                    # один день решает всё: стоп, сработавший в начале месяца,
+                    # истекает ровно перед следующей ребалансировкой, и бумага
+                    # возвращается в портфель — та самая карусель, ради отказа от
+                    # которой карантин и введён.
+                    blocked = [p for p, until in quarantine.items() if signal_day < until]
+                    scores = scores.drop(index=blocked, errors="ignore")
                     selected = select_portfolio(
                         scores, universe["sector"], portfolio_rules,
                         held=pd.Index(list(positions)),
                     )
                     selected = _tradable_at_execution(selected, last_alive, today)
-                    target = equal_weights(selected)
+                    target = limits.apply(equal_weights(selected))
 
             if target is not None:
                 equity = sum(positions.values()) + cash
@@ -243,12 +296,21 @@ def run_backtest(
 
                 equity_after = equity * (1.0 - cost)
                 cost_factor *= 1.0 - cost
-                positions = {int(p): float(w * equity_after) for p, w in target.items()}
-                cash = equity_after if target.empty else 0.0
+                opened = {int(p): float(w * equity_after) for p, w in target.items()}
+                cash = equity_after * float(1.0 - target.sum()) if len(target) else equity_after
+                entries = _update_entries(entries, opened, panel.openadj.loc[today])
+                positions = opened
                 invested = invested or bool(positions) or risk_off
 
-            # Шаг 3: от открытия к закрытию уже новым составом.
+        if priced_at_open:
+            # От открытия к закрытию — уже итоговым составом дня.
             positions = _revalue(positions, panel.openadj, closeadj, today, today)
+
+        # Вечером проверяем стопы: условие по закрытию, сделка завтра по открытию.
+        # Внутридневного минимума у нас нет и быть не должно (ТЗ 2).
+        if stop_rules.enabled and positions:
+            live = {p: e for p, e in entries.items() if p in positions}
+            pending_stops |= stop_rules.triggered(live, closeadj.loc[today])
 
         if invested:
             value = sum(positions.values()) + cash
@@ -275,6 +337,8 @@ def run_backtest(
         risk_off_dates=risk_off_dates,
         universe_members=universe_members,
         trades=pd.Series(trades_log, name="trades", dtype="int64").sort_index(),
+        stops=stops_log,
+        throttled=throttled,
     )
 
 
@@ -300,6 +364,57 @@ def _tradable_at_execution(
             len(selected) - len(alive),
         )
     return pd.Index(alive, name="permaticker")
+
+
+def _update_entries(
+    entries: dict[int, float], positions: dict[int, float], open_prices: pd.Series
+) -> dict[int, float]:
+    """Цены входа после ребалансировки.
+
+    У новой позиции вход — открытие дня исполнения. У продолжающейся цена входа
+    сохраняется: изменение веса сделкой по входу не является, и обнулять счётчик
+    просадки при доведении доли было бы неправдой.
+    """
+    updated = {}
+    for permaticker in positions:
+        if permaticker in entries:
+            updated[permaticker] = entries[permaticker]
+        else:
+            price = open_prices.get(permaticker)
+            if price is not None and pd.notna(price) and price > 0:
+                updated[permaticker] = float(price)
+    return updated
+
+
+def _execute_stops(
+    positions: dict[int, float],
+    cash: float,
+    pending: set[int],
+    throttle: TradeThrottle,
+    history: list[pd.Timestamp],
+    today: pd.Timestamp,
+) -> tuple[dict[int, float], float, list[int], set[int]]:
+    """Продаёт по открытию позиции, пробившие стоп вчера.
+
+    Порядок исполнения при работающем ограничителе — по возрастанию permaticker.
+    Выбор произволен, но он обязан быть детерминированным: иначе результат
+    прогона зависел бы от порядка обхода словаря, и повторить его было бы нельзя.
+    """
+    wanted = sorted(p for p in pending if p in positions)
+    allowed = throttle.allowed(history, today)
+    executing, deferred = wanted[:allowed], set(wanted[allowed:])
+
+    if deferred:
+        log.warning(
+            "%s: ограничитель отложил %d стоп-выходов из %d (не больше %s за неделю)",
+            today.date(), len(deferred), len(wanted), throttle.max_trades_per_week,
+        )
+
+    for permaticker in executing:
+        cash += positions.pop(permaticker, 0.0)
+
+    # Позиции, исчезнувшие по другой причине (делистинг), из очереди убираются.
+    return positions, cash, executing, deferred
 
 
 def _count_trades(before: pd.Series, after: pd.Series) -> int:
