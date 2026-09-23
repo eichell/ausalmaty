@@ -18,8 +18,15 @@ DSR отвечает на правильный вопрос: какова вер
     зарабатывает по чуть-чуть и изредка теряет много, обычная в акциях, и
     обычный Sharpe её переоценивает.
 
-Sharpe везде **не годовой**: формула работает в тех единицах, в которых считаются
-доходности, и число наблюдений входит в неё отдельно.
+Единицы. Формула Bailey работает в частоте самих наблюдений: при дневных
+доходностях внутри всё считается в дневных Sharpe, а число наблюдений входит
+отдельным множителем. Разброс между испытаниями, наоборот, приходит из отчётов,
+где Sharpe годовой, — и его нужно перевести, иначе планка окажется завышенной в
+sqrt(252) раз, то есть примерно в шестнадцать. Такая проверка не пропустила бы
+ничего и молчаливо забраковала бы любую стратегию.
+
+Поэтому `sharpe_variance` принимается **в годовых единицах** (как его отдаёт
+карта чувствительности), а перевод делается здесь, в одном месте.
 """
 
 from __future__ import annotations
@@ -37,6 +44,9 @@ log = logging.getLogger(__name__)
 
 #: Постоянная Эйлера — Маскерони. Входит в оценку матожидания максимума выборки.
 EULER_MASCHERONI = 0.5772156649015329
+
+#: Торговых дней в году — для перевода разброса Sharpe между испытаниями.
+TRADING_DAYS_PER_YEAR = 252
 
 
 @dataclass(frozen=True)
@@ -56,11 +66,24 @@ class DeflatedSharpe:
         """Принято считать результат состоятельным при DSR выше 0.95."""
         return self.probability > 0.95
 
+    #: Наблюдений в году — чтобы печатать Sharpe в привычном годовом виде.
+    periods_per_year: int = 252
+
+    @property
+    def annualized_sharpe(self) -> float:
+        return self.sharpe * math.sqrt(self.periods_per_year)
+
+    @property
+    def annualized_threshold(self) -> float:
+        """Планка перебора в годовом выражении — только для чтения человеком."""
+        return self.expected_max_sharpe * math.sqrt(self.periods_per_year)
+
     def summary(self) -> str:
         verdict = "проходит" if self.survives else "НЕ ПРОХОДИТ"
         return (
             f"DSR = {self.probability:.3f} ({verdict}) при {self.n_trials} испытаниях; "
-            f"Sharpe {self.sharpe:.3f} против порога перебора {self.expected_max_sharpe:.3f}"
+            f"Sharpe {self.annualized_sharpe:.2f} против порога перебора "
+            f"{self.annualized_threshold:.2f} (годовые)"
         )
 
 
@@ -78,15 +101,22 @@ def expected_max_sharpe(sharpe_variance: float, n_trials: int) -> float:
 
 
 def deflated_sharpe_ratio(
-    returns: pd.Series, *, n_trials: int, sharpe_variance: float | None = None
+    returns: pd.Series,
+    *,
+    n_trials: int,
+    sharpe_variance: float | None = None,
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
 ) -> DeflatedSharpe:
     """Вероятность того, что Sharpe не объясняется перебором.
 
     Args:
         returns: доходности стратегии в своей исходной частоте (дневные).
         n_trials: число проведённых испытаний — из журнала ТЗ 9.2.1.
-        sharpe_variance: разброс Sharpe между испытаниями. Если не задан, берётся
-            консервативная оценка 1/(T−1) — дисперсия Sharpe при нулевом сигнале.
+        sharpe_variance: разброс Sharpe между испытаниями, **в годовых единицах**
+            — именно такой отдаёт карта чувствительности. Переводится внутрь
+            частоты наблюдений здесь. Если не задан, берётся консервативная
+            оценка 1/(T−1): дисперсия дневного Sharpe при нулевом сигнале.
+        periods_per_year: наблюдений в году, для перевода разброса.
 
     Raises:
         ValueError: если наблюдений меньше трёх — считать нечего.
@@ -103,10 +133,13 @@ def deflated_sharpe_ratio(
     g4 = float(kurtosis(clean, fisher=False, bias=False))
 
     if sharpe_variance is None:
-        sharpe_variance = 1.0 / (n - 1)
+        variance_per_period = 1.0 / (n - 1)
         log.debug("Разброс Sharpe между испытаниями не задан, взята оценка 1/(T−1)")
+    else:
+        # Годовой Sharpe = периодный × sqrt(P), значит дисперсии относятся как P.
+        variance_per_period = sharpe_variance / periods_per_year
 
-    threshold = expected_max_sharpe(sharpe_variance, n_trials)
+    threshold = expected_max_sharpe(variance_per_period, n_trials)
 
     denominator = 1.0 - g3 * sharpe + (g4 - 1.0) / 4.0 * sharpe**2
     if denominator <= 0:
@@ -121,6 +154,7 @@ def deflated_sharpe_ratio(
     return DeflatedSharpe(
         sharpe=sharpe, expected_max_sharpe=threshold, probability=probability,
         n_trials=n_trials, n_observations=n, skewness=g3, kurtosis=g4,
+        periods_per_year=periods_per_year,
     )
 
 

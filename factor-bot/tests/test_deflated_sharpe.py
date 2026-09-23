@@ -129,3 +129,47 @@ def test_spread_comes_from_the_sensitivity_map():
 
 def test_a_single_trial_has_no_spread():
     assert sharpe_variance_from_trials(pd.Series([0.8])) == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------- #
+# Единицы измерения
+# --------------------------------------------------------------------------- #
+
+
+def test_trial_spread_is_taken_in_annual_units():
+    """Карта чувствительности отдаёт годовые Sharpe, а формула работает в дневных.
+
+    Без перевода планка перебора завышается в sqrt(252) ≈ 16 раз, и проверка
+    молча бракует любую стратегию. Ошибка не видна при одном испытании: там
+    порог равен нулю и DSR выходит единичным.
+    """
+    returns = _returns(0.0012, 0.01, n=5000)
+    dsr = deflated_sharpe_ratio(returns, n_trials=20, sharpe_variance=0.04)
+
+    # Разброс годовых Sharpe 0.04 (то есть σ = 0.2) даёт планку около 0.38
+    # годовых — величина того же порядка, что и сам Sharpe стратегии.
+    assert 0.2 < dsr.annualized_threshold < 0.8
+    assert dsr.annualized_threshold < dsr.annualized_sharpe * 3
+
+
+def test_annualized_sharpe_is_reported_not_the_daily_one():
+    """В отчёте должна стоять привычная годовая цифра, иначе её нельзя сравнить
+    ни с ориентирами ТЗ 9.3, ни с чужими результатами."""
+    returns = _returns(0.0008, 0.01, n=3000)
+    dsr = deflated_sharpe_ratio(returns, n_trials=5, sharpe_variance=0.04)
+
+    assert dsr.annualized_sharpe == pytest.approx(dsr.sharpe * np.sqrt(252))
+    assert "годовые" in dsr.summary()
+    assert f"{dsr.annualized_sharpe:.2f}" in dsr.summary()
+
+
+def test_more_observations_raise_the_verdict_at_the_same_sharpe():
+    """Тот же Sharpe на длинной истории надёжнее, чем на короткой, — ради этого
+    в формуле и стоит число наблюдений."""
+    rng = np.random.default_rng(11)
+    short = pd.Series(rng.normal(0.0006, 0.01, 950))      # ~3.8 года
+    long = pd.Series(rng.normal(0.0006, 0.01, 6750))      # ~27 лет
+
+    a = deflated_sharpe_ratio(short, n_trials=20, sharpe_variance=0.04)
+    b = deflated_sharpe_ratio(long, n_trials=20, sharpe_variance=0.04)
+    assert b.probability > a.probability
