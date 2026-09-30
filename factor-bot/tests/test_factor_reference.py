@@ -177,3 +177,61 @@ def test_monthly_returns_are_taken_from_month_ends():
     equity = pd.Series(np.linspace(1.0, 1.3, len(days)), index=days)
     out = FR.monthly_returns(equity)
     assert list(out.index.astype(str)) == ["2010-02", "2010-03"]
+
+
+# --------------------------------------------------------------------------- #
+# Премия фактора в окне: ключ к трактовке теста ТЗ 9.2.4
+# --------------------------------------------------------------------------- #
+
+
+def deciles_archive(tmp_path, hi: float, mid: float, lo: float, months=None) -> str:
+    """Архив, где верхний, средние и нижний децили дают заданные доходности."""
+    months = months or MONTHS
+    head = "," + ",".join(FR.ALL_DECILES)
+    rows = []
+    for m in months:
+        values = [lo] + [mid] * 8 + [hi]
+        rows.append(f"{m}," + ",".join(f"{v:.2f}" for v in values))
+    block = "\n".join([f"  {FR.EQUAL_WEIGHTED_HEADER}", head, *rows])
+    vw = "\n".join([f"  {FR.VALUE_WEIGHTED_HEADER}", head, *rows])
+    path = tmp_path / "deciles.zip"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("10_Portfolios_Prior_12_2.csv", "\n".join([vw, "", block]))
+    return str(path)
+
+
+def test_factor_with_a_premium_shows_it(tmp_path):
+    path = deciles_archive(tmp_path, hi=2.0, mid=1.0, lo=0.0)
+    table = FR.universe_premium(path, MONTHS[0][:4] + "-" + MONTHS[0][4:],
+                                MONTHS[-1][:4] + "-" + MONTHS[-1][4:])
+    hi = table.loc["верхний дециль", "CAGR, %"]
+    universe = table.loc["вся вселенная (равные доли)", "CAGR, %"]
+    assert hi > universe
+
+
+def test_factor_without_a_premium_shows_that_too(tmp_path):
+    """Если дециль не отличается от вселенной, отчёт обязан это показать.
+
+    Именно это и оказалось в 1999-2012: верхний дециль momentum по Sharpe шёл
+    ниже равных долей во всех децилях, и «преимущества не видно» в тесте ТЗ 9.2.4
+    — свойство периода, а не дефект реализации.
+    """
+    path = deciles_archive(tmp_path, hi=1.0, mid=1.0, lo=1.0)
+    table = FR.universe_premium(path, "2010-01", "2012-12")
+    hi = table.loc["верхний дециль", "CAGR, %"]
+    universe = table.loc["вся вселенная (равные доли)", "CAGR, %"]
+    assert hi == pytest.approx(universe)
+
+
+def test_short_window_is_refused(tmp_path):
+    path = deciles_archive(tmp_path, hi=2.0, mid=1.0, lo=0.0)
+    with pytest.raises(ValueError, match="месяц"):
+        FR.universe_premium(path, "2010-01", "2010-06")
+
+
+def test_deciles_keep_their_order_from_losers_to_winners(tmp_path):
+    path = deciles_archive(tmp_path, hi=2.0, mid=1.0, lo=0.0)
+    frame = FR.load_all_deciles(path)
+    assert list(frame.columns) == list(FR.ALL_DECILES)
+    assert frame["Lo PRIOR"].iloc[0] == pytest.approx(0.0)
+    assert frame["Hi PRIOR"].iloc[0] == pytest.approx(0.02)

@@ -261,6 +261,14 @@ def compare(
     )
 
 
+def _sharpe(monthly: pd.Series) -> float:
+    """Годовой Sharpe из месячных доходностей. Нулевой разброс — не бесконечность."""
+    sigma = monthly.std(ddof=1)
+    if not sigma or not np.isfinite(sigma):
+        return float("nan")
+    return float(monthly.mean() / sigma * np.sqrt(12))
+
+
 def _annual(monthly: pd.Series) -> pd.Series:
     """Годовая доходность из месячных, сложением по правилу сложного процента."""
     by_year = (1.0 + monthly).groupby(monthly.index.year).prod() - 1.0
@@ -371,6 +379,27 @@ def main(argv: list[str] | None = None) -> int:
 
     comparisons = compare_both(frame[args.column].dropna(), args.cache, force=args.force)
     print(verdict(comparisons))
+
+    # Был ли у фактора премия в этом окне вообще. Печатается всегда: без этого
+    # результат теста ТЗ 9.2.4 прочитать нельзя (см. universe_premium).
+    monthly = monthly_returns(frame[args.column].dropna())
+    start, end = str(monthly.index.min()), str(monthly.index.max())
+    print(f"\n=== Премия фактора в этом окне ({start} — {end}) ===")
+    for equal_weighted, label in WEIGHTING_LABELS.items():
+        try:
+            table = universe_premium(
+                args.cache, start, end, equal_weighted=equal_weighted
+            )
+        except (ValueError, ReferenceUnavailable) as exc:
+            print(f"  {label}: посчитать не удалось — {exc}")
+            continue
+        hi = table.loc["верхний дециль"]
+        universe = table.loc["вся вселенная (равные доли)"]
+        print(f"\n--- {label} ---")
+        print(table.to_string(float_format=lambda v: f"{v:8.2f}"))
+        print(f"премия верхнего дециля над вселенной: "
+              f"{hi['CAGR, %'] - universe['CAGR, %']:+.2f} пп CAGR, "
+              f"{hi['Sharpe'] - universe['Sharpe']:+.2f} Sharpe")
     best = max(c.monthly_correlation for c in comparisons.values())
     return 0 if best >= MIN_MONTHLY_CORRELATION else 1
 
@@ -379,3 +408,72 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(main())
+
+
+# --------------------------------------------------------------------------- #
+# Была ли у фактора премия в этом периоде — и доступна ли она long-only
+# --------------------------------------------------------------------------- #
+
+#: Все десять портфелей файла, от проигравших к победителям.
+ALL_DECILES = ("Lo PRIOR", "PRIOR 2", "PRIOR 3", "PRIOR 4", "PRIOR 5",
+               "PRIOR 6", "PRIOR 7", "PRIOR 8", "PRIOR 9", "Hi PRIOR")
+
+
+def load_all_deciles(
+    archive: str | Path, *, equal_weighted: bool = True
+) -> pd.DataFrame:
+    """Все десять портфелей файла Френча, в долях."""
+    with zipfile.ZipFile(archive) as z:
+        names = [n for n in z.namelist() if n.lower().endswith(".csv")]
+        text = z.read(names[0]).decode("utf-8", "replace")
+
+    wanted = EQUAL_WEIGHTED_HEADER if equal_weighted else VALUE_WEIGHTED_HEADER
+    frame = pd.read_csv(io.StringIO(_extract_block(text, wanted)), index_col=0)
+    frame.columns = [c.strip() for c in frame.columns]
+    keep = [str(i).strip().isdigit() and len(str(i).strip()) == 6 for i in frame.index]
+    frame = frame.loc[keep]
+    frame.index = pd.PeriodIndex([str(i).strip() for i in frame.index], freq="M")
+    frame = frame.apply(pd.to_numeric, errors="coerce")
+    for marker in MISSING_MARKERS:
+        frame = frame.replace(marker, float("nan"))
+    return frame[list(ALL_DECILES)] / 100.0
+
+
+def universe_premium(
+    archive: str | Path, start: str, end: str, *, equal_weighted: bool = True
+) -> pd.DataFrame:
+    """Что давал верхний дециль против всей вселенной в заданном окне.
+
+    Это не сверка реализации, а вопрос к самому периоду, и он решает трактовку
+    теста ТЗ 9.2.4. Тест сравнивает наш портфель со случайным отбором из той же
+    вселенной. Если у верхнего дециля в этом окне и в опубликованных данных нет
+    преимущества над вселенной, то «преимущества не видно» — свойство периода, а
+    не дефект реализации, и искать ошибку в коде бессмысленно.
+
+    Средним по вселенной берутся равные доли во всех десяти децилях: это и есть
+    случайный отбор из той же совокупности бумаг.
+
+    Returns:
+        Кадр с CAGR и Sharpe для верхнего дециля, среднего по децилям и нижнего.
+    """
+    deciles = load_all_deciles(archive, equal_weighted=equal_weighted)
+    window = deciles.loc[start:end].dropna()
+    if len(window) < 24:
+        raise ValueError(f"В окне {start}—{end} всего {len(window)} месяцев.")
+
+    years = len(window) / 12.0
+    portfolios = {
+        "верхний дециль": window["Hi PRIOR"],
+        "вся вселенная (равные доли)": window.mean(axis=1),
+        "нижний дециль": window["Lo PRIOR"],
+    }
+    rows = {
+        name: {
+            "CAGR, %": 100.0 * ((1.0 + series).prod() ** (1 / years) - 1.0),
+            "Sharpe": _sharpe(series),
+        }
+        for name, series in portfolios.items()
+    }
+    out = pd.DataFrame(rows).T
+    out.index.name = "портфель"
+    return out
