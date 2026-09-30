@@ -59,8 +59,10 @@ def build_full_database(
         sep_map = sharadar.build_ticker_map(tickers_raw, "stocks")
         sf1_map = sharadar.build_ticker_map(tickers_raw, "fundamentals")
 
-        prices = sharadar.normalize_sep(provider.fetch_table("stocks", force=force), sep_map)
-        counts["prices"] = _insert(conn, "prices", prices)
+        counts["prices"] = _insert_streamed(
+            conn, "prices", provider, "stocks",
+            lambda chunk: sharadar.normalize_sep(chunk, sep_map), force=force,
+        )
 
         # Фундаментал пишется только через pit.py (ТЗ 4.8).
         sf1 = sharadar.normalize_sf1(provider.fetch_table("fundamentals", force=force), sf1_map)
@@ -79,10 +81,10 @@ def build_full_database(
             )
 
         if load_daily_control:
-            daily_raw = _fetch_optional(provider, "daily", force=force)
-            counts["daily_control"] = (
-                _insert(conn, "daily_control", sharadar.normalize_daily(daily_raw, sep_map))
-                if daily_raw is not None else 0
+            counts["daily_control"] = _insert_streamed(
+                conn, "daily_control", provider, "daily",
+                lambda chunk: sharadar.normalize_daily(chunk, sep_map),
+                force=force, optional=True,
             )
     finally:
         conn.close()
@@ -115,14 +117,47 @@ def preflight(provider: sharadar.SharadarProvider) -> dict[str, sharadar.TableAc
     return access
 
 
-def _insert(conn: duckdb.DuckDBPyConnection, table: str, df) -> int:
+def _insert_streamed(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    provider,
+    source: str,
+    normalize,
+    *,
+    force: bool = False,
+    optional: bool = False,
+) -> int:
+    """Грузит большую таблицу порциями: читает, нормализует, пишет и забывает.
+
+    Полная история цен не помещается в память одним кадром — тридцать лет по
+    строке на бумагу на торговый день. Порционная обработка ничего не меняет в
+    логике: нормализация построчная, а дубликаты между порциями снимает
+    первичный ключ таблицы.
+    """
+    total = 0
+    try:
+        chunks = provider.iter_table(source, force=force)
+        for chunk in chunks:
+            total += _insert(conn, table, normalize(chunk), quiet=True)
+    except sharadar.SubscriptionError as exc:
+        if not optional:
+            raise
+        log.warning("%s пропущена: %s", source, exc)
+        return 0
+
+    log.info("%s: записано %d строк", table, total)
+    return total
+
+
+def _insert(conn: duckdb.DuckDBPyConnection, table: str, df, *, quiet: bool = False) -> int:
     if df is None or df.empty:
         log.warning("%s: нечего писать", table)
         return 0
     conn.register("_chunk", df)
     conn.execute(f"INSERT OR REPLACE INTO {table} SELECT * FROM _chunk")
     conn.unregister("_chunk")
-    log.info("%s: записано %d строк", table, len(df))
+    if not quiet:
+        log.info("%s: записано %d строк", table, len(df))
     return len(df)
 
 

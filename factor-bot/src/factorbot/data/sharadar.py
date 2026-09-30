@@ -53,6 +53,14 @@ REQUIRED_TABLES: tuple[str, ...] = ("tickers", "stocks", "fundamentals")
 #: загрузку, но обязано быть видно: без actions результат завышен систематически.
 OPTIONAL_TABLES: tuple[str, ...] = ("actions", "daily")
 
+#: Сколько строк читать за раз у больших таблиц. Два миллиона строк цен — это
+#: порядка гигабайта в pandas, что оставляет запас даже в тесном контейнере.
+DEFAULT_CHUNK_ROWS = 2_000_000
+
+#: Таблицы, которые заведомо не помещаются в память целиком: одна строка на
+#: бумагу на торговый день за тридцать лет.
+STREAMED_TABLES: frozenset[str] = frozenset({"stocks", "daily"})
+
 #: Глубина выгрузки. Протокол ТЗ 9.1 требует истории с 1998 года, поэтому здесь
 #: только "full"; значения "5" и "10" оставлены на случай урезанной подписки —
 #: с ними раздел 9 придётся переписывать, и это должно быть видно в конфиге.
@@ -147,14 +155,50 @@ class SharadarProvider(DataProvider):
         return TABLES
 
     def fetch_table(self, table: str, *, force: bool = False) -> pd.DataFrame:
-        """Отдаёт сырую таблицу целиком, из кэша или из сети (ТЗ 4.2)."""
+        """Отдаёт сырую таблицу целиком, из кэша или из сети (ТЗ 4.2).
+
+        Годится для справочника, отчётности и корпоративных действий. Для цен и
+        дневных метрик пользуйтесь `iter_table`: они не помещаются в память.
+        """
+        return _read_csv_zip(self._ensure_archive(table, force=force))
+
+    def iter_table(
+        self, table: str, *, chunksize: int = DEFAULT_CHUNK_ROWS, force: bool = False
+    ):
+        """Отдаёт сырую таблицу порциями строк.
+
+        Полная история цен — 3.2 ГБ в CSV, и в память одним кадром она
+        разворачивается примерно в четырнадцать: pandas хранит строковые колонки
+        объектами. Контейнер такого не переживает, и однажды уже не пережил.
+
+        Порции решают это без потери логики: нормализация у нас построчная, а
+        дубликаты между порциями снимает первичный ключ таблицы.
+
+        Yields:
+            Кадры не более `chunksize` строк каждый.
+        """
+        archive = self._ensure_archive(table, force=force)
+        with zipfile.ZipFile(archive) as z:
+            name = _single_csv(z)
+            with z.open(name) as fh:
+                reader = pd.read_csv(
+                    io.TextIOWrapper(fh, encoding="utf-8"),
+                    low_memory=False,
+                    chunksize=chunksize,
+                )
+                for i, chunk in enumerate(reader, start=1):
+                    log.info("%s: порция %d, строк %d", table, i, len(chunk))
+                    yield chunk
+
+    def _ensure_archive(self, table: str, *, force: bool = False) -> Path:
+        """Путь к архиву таблицы: из кэша или после скачивания."""
         if table not in TABLES:
             raise ValueError(f"Таблица {table!r} не входит в ТЗ 4.2: {TABLES}")
 
         cached = self._cached_path(table)
         if cached is not None and not force:
             log.info("%s: беру из кэша %s", table, cached)
-            return _read_csv_zip(cached)
+            return cached
 
         if not self.api_key:
             raise SharadarError(
@@ -166,7 +210,7 @@ class SharadarProvider(DataProvider):
         self._download_bulk(table, target)
         log.info("%s: сохранено в %s (%.1f МБ)", table, target,
                  target.stat().st_size / 1e6)
-        return _read_csv_zip(target)
+        return target
 
     def _cached_path(self, table: str) -> Path | None:
         d = self.cache_dir / table
@@ -283,13 +327,17 @@ def _api_error(response: requests.Response) -> str:
     return f"HTTP {response.status_code}: {str(payload)[:200]}"
 
 
+def _single_csv(archive: zipfile.ZipFile) -> str:
+    names = [n for n in archive.namelist() if n.lower().endswith(".csv")]
+    if len(names) != 1:
+        raise SharadarError(f"В архиве ожидался один CSV, найдено: {names}")
+    return names[0]
+
+
 def _read_csv_zip(archive: Path) -> pd.DataFrame:
     """Bulk-выгрузка приходит zip-архивом с одним CSV внутри."""
     with zipfile.ZipFile(archive) as z:
-        names = [n for n in z.namelist() if n.lower().endswith(".csv")]
-        if len(names) != 1:
-            raise SharadarError(f"В архиве ожидался один CSV, найдено: {names}")
-        with z.open(names[0]) as fh:
+        with z.open(_single_csv(z)) as fh:
             return pd.read_csv(io.TextIOWrapper(fh, encoding="utf-8"), low_memory=False)
 
 
