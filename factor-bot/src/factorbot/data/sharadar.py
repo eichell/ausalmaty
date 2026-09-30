@@ -59,7 +59,7 @@ DEFAULT_CHUNK_ROWS = 2_000_000
 
 #: Таблицы, которые заведомо не помещаются в память целиком: одна строка на
 #: бумагу на торговый день за тридцать лет.
-STREAMED_TABLES: frozenset[str] = frozenset({"stocks", "daily"})
+STREAMED_TABLES: frozenset[str] = frozenset({"stocks", "daily", "fundamentals"})
 
 #: Глубина выгрузки. Протокол ТЗ 9.1 требует истории с 1998 года, поэтому здесь
 #: только "full"; значения "5" и "10" оставлены на случай урезанной подписки —
@@ -501,7 +501,9 @@ def normalize_sep(sep_raw: pd.DataFrame, tmap: pd.DataFrame) -> pd.DataFrame:
     return out.drop_duplicates(subset=["permaticker", "date"], keep="last").reset_index(drop=True)
 
 
-def normalize_sf1(sf1_raw: pd.DataFrame, tmap: pd.DataFrame) -> pd.DataFrame:
+def normalize_sf1(
+    sf1_raw: pd.DataFrame, tmap: pd.DataFrame, *, strict: bool = True
+) -> pd.DataFrame:
     """SF1 → кадр под схему фундаментала (ТЗ 4.3, 4.7).
 
     Разделение измерений жёсткое: ART несёт только потоковые величины, ARQ — только
@@ -514,12 +516,19 @@ def normalize_sf1(sf1_raw: pd.DataFrame, tmap: pd.DataFrame) -> pd.DataFrame:
 
     Знак `capex_ttm` сохраняется как у поставщика — отток отрицателен. Формула FCF
     в ТЗ 6.2 записана для положительного capex; см. README, раздел отклонений.
+
+    Args:
+        strict: падать, если после фильтра измерений не осталось строк. При
+            порционном чтении это нормально — в отдельную порцию могут попасть
+            одни MR*-строки, — поэтому там проверка переносится на всю таблицу.
     """
     df = sf1_raw.copy()
     df["dimension"] = df["dimension"].astype("string").str.upper()
     df = df.loc[df["dimension"].isin(["ART", "ARQ"])]
     if df.empty:
-        raise SharadarError("В SF1 не осталось строк с измерениями ART/ARQ (ТЗ 4.3).")
+        if strict:
+            raise SharadarError("В SF1 не осталось строк с измерениями ART/ARQ (ТЗ 4.3).")
+        return _empty_fundamental_frame()
 
     df = attach_permaticker(df, tmap, date_col="reportperiod", slack_days=0)
 
@@ -550,6 +559,13 @@ def normalize_sf1(sf1_raw: pd.DataFrame, tmap: pd.DataFrame) -> pd.DataFrame:
         out = out.loc[~missing_key]
 
     return out.reset_index(drop=True)
+
+
+def _empty_fundamental_frame() -> pd.DataFrame:
+    """Пустая порция с правильными колонками — чтобы вызывающий код не ветвился."""
+    columns = ["permaticker", "ticker", "dimension", "reportperiod", "calendardate",
+               "available_from", *FLOW_FIELDS.values(), *STOCK_FIELDS.values()]
+    return pd.DataFrame({c: pd.Series(dtype="object") for c in columns})
 
 
 def normalize_actions(actions_raw: pd.DataFrame, tmap: pd.DataFrame) -> pd.DataFrame:

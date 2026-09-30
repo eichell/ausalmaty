@@ -65,8 +65,18 @@ def build_full_database(
         )
 
         # Фундаментал пишется только через pit.py (ТЗ 4.8).
-        sf1 = sharadar.normalize_sf1(provider.fetch_table("fundamentals", force=force), sf1_map)
-        counts["fundamental_rows"] = pit.load_fundamentals(conn, sf1)
+        written = 0
+        for chunk in provider.iter_table("fundamentals", force=force):
+            written += pit.load_fundamentals(
+                conn, sharadar.normalize_sf1(chunk, sf1_map, strict=False)
+            )
+        if written == 0:
+            raise sharadar.SharadarError(
+                "В отчётности не оказалось ни одной строки с измерениями ART/ARQ "
+                "(ТЗ 4.3): собирать value не из чего."
+            )
+        counts["fundamental_rows"] = written
+        log.info("fundamentals: записано %d строк", written)
 
         actions_raw = _fetch_optional(provider, "actions", force=force)
         if actions_raw is not None:
