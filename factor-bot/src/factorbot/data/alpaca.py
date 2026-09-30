@@ -27,6 +27,12 @@ log = logging.getLogger(__name__)
 TRADING_API = "https://api.alpaca.markets"
 DATA_API = "https://data.alpaca.markets"
 
+#: Насколько отступать от сегодняшнего дня при запросе баров. Бесплатный тариф
+#: Alpaca не отдаёт свежие данные — «subscription does not permit querying recent
+#: SIP data», — и отказывает всему запросу целиком, а не обрезает его. Дневной бар
+#: за сегодня всё равно неполон и для сверки непригоден.
+RECENT_DATA_LAG_DAYS = 1
+
 #: Порог расхождения цен из ТЗ 4.6.3. Больше — искать ошибку в обработке
 #: корпоративных действий, у себя или у поставщика.
 PRICE_TOLERANCE = 0.005
@@ -101,7 +107,8 @@ class AlpacaVenue(ExecutionVenue):
                 if page_token:
                     params["page_token"] = page_token
                 r = self._session.get(f"{DATA_API}/v2/stocks/bars", params=params, timeout=120)
-                r.raise_for_status()
+                if not r.ok:
+                    raise AlpacaError(_bars_error(r, start, end))
                 payload = r.json()
                 for symbol, bars in (payload.get("bars") or {}).items():
                     for b in bars:
@@ -119,6 +126,22 @@ class AlpacaVenue(ExecutionVenue):
 # --------------------------------------------------------------------------- #
 # Чистые функции — проверяемы без сети
 # --------------------------------------------------------------------------- #
+
+
+def _bars_error(response: requests.Response, start: date, end: date) -> str:
+    """Внятное сообщение вместо трейсбека: отказ тарифа лечится не повтором."""
+    try:
+        message = response.json().get("message", "")
+    except ValueError:
+        message = response.text[:200]
+
+    if "recent" in message.lower():
+        return (
+            f"Alpaca отказала в свежих данных ({message}). Запрошен отрезок "
+            f"{start} — {end}; бесплатный тариф отдаёт бары не ближе чем "
+            f"{RECENT_DATA_LAG_DAYS} дн. назад. Сдвиньте верхнюю границу."
+        )
+    return f"Alpaca вернула {response.status_code}: {message}"
 
 
 def build_alpaca_map(

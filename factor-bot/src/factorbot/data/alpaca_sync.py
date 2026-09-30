@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
@@ -27,6 +27,8 @@ import pandas as pd
 from factorbot.config import load_config, load_dotenv
 from factorbot.data.alpaca import (
     PRICE_TOLERANCE,
+    RECENT_DATA_LAG_DAYS,
+    AlpacaError,
     AlpacaVenue,
     build_alpaca_map,
     reconcile_prices,
@@ -107,7 +109,9 @@ def reconcile(
         Непустой означает ошибку обработки корпоративных действий с чьей-то
         стороны, и разбирать её нужно до того, как momentum примет её за сигнал.
     """
-    end = end or date.today()
+    # Верхняя граница отодвинута от сегодняшнего дня: бесплатный тариф Alpaca
+    # свежие данные не отдаёт, а дневной бар за сегодня всё равно неполон.
+    end = end or (date.today() - timedelta(days=RECENT_DATA_LAG_DAYS))
     if start < OVERLAP_START:
         log.warning(
             "История Alpaca начинается в 2016 году (ТЗ 4.6): дата %s поднята до %s",
@@ -185,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
     conn = duckdb.connect(str(db_path))
     try:
         return _dispatch(args, conn, venue)
-    except RuntimeError as exc:
+    except (RuntimeError, AlpacaError) as exc:
         # Незаполненная карта или пустой справочник — ожидаемые состояния,
         # а не сбой программы. Трейсбек тут только прячет подсказку.
         log.error("%s", exc)
