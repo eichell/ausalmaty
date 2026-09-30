@@ -196,3 +196,53 @@ def test_counts_are_reported_by_category(caplog):
     assert "деньгами 1" in caplog.text
     assert "акциями 1" in caplog.text
     assert "без данных 2" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# Разбор делистингов в результате прогона (ТЗ 4.1 в отчёте)
+# --------------------------------------------------------------------------- #
+
+
+def test_breakdown_separates_total_losses_from_acquisitions():
+    """Отчёт обязан показывать, сколько результата держится на допущении −100%."""
+    from factorbot.backtest.engine import BacktestResult
+
+    result = BacktestResult(
+        equity_net=pd.Series([1.0, 1.1]),
+        equity_gross=pd.Series([1.0, 1.1]),
+        delistings=[
+            (pd.Timestamp("2005-01-03"), 1, -1.0, 0.033),
+            (pd.Timestamp("2006-01-03"), 2, -1.0, 0.033),
+            (pd.Timestamp("2007-01-03"), 3, 0.01, 0.033),
+            (pd.Timestamp("2008-01-03"), 4, 0.35, 0.033),
+        ],
+    )
+    out = result.delisting_breakdown()
+    assert int(out.loc["полная потеря (−100%)", "событий"]) == 2
+    assert out.loc["полная потеря (−100%)", "вклад, пп"] == pytest.approx(-6.6, abs=0.01)
+    assert int(out.loc["около нуля", "событий"]) == 1
+    assert int(out.loc["прибыль", "событий"]) == 1
+
+
+def test_breakdown_is_empty_without_delistings():
+    from factorbot.backtest.engine import BacktestResult
+
+    result = BacktestResult(
+        equity_net=pd.Series([1.0]), equity_gross=pd.Series([1.0])
+    )
+    assert result.delisting_breakdown().empty
+
+
+def test_engine_records_every_delisting_with_its_weight():
+    """Вклад считается от капитала на момент события, а не от единицы."""
+    from factorbot.backtest.engine import _settle_delistings
+
+    positions = {1: 0.30, 2: 0.20}
+    last_alive = pd.Series({1: pd.Timestamp("2005-01-03"), 2: pd.Timestamp("2010-01-01")})
+    survivors, cash, events = _settle_delistings(
+        positions, 0.5, last_alive, pd.Timestamp("2005-01-04"),
+        pd.Series({1: -0.40}),
+    )
+    assert list(survivors) == [2]
+    assert events == [(1, 0.30, -0.40)]
+    assert cash == pytest.approx(0.5 + 0.30 * 0.60)

@@ -66,12 +66,49 @@ class BacktestResult:
     trades: pd.Series = field(default_factory=lambda: pd.Series(dtype="int64"))
     #: Сработавшие стоп-лоссы: (дата исполнения, permaticker). Вне ТЗ.
     stops: list[tuple[pd.Timestamp, int]] = field(default_factory=list)
+    #: Закрытые делистингом позиции: (дата, permaticker, доходность, доля капитала).
+    #: Допущение ТЗ 4.1 — самое чувствительное в проекте: больше половины ушедших
+    #: бумаг не имеет данных об оплате и считается как −100%. Без этого списка в
+    #: отчёте нельзя ответить, насколько результат зависит от допущения, а не от
+    #: стратегии, — а один раз уже оказалось, что зависит целиком.
+    delistings: list[tuple[pd.Timestamp, int, float, float]] = field(default_factory=list)
     #: Сколько раз ограничитель откладывал стоп-выход.
     throttled: int = 0
 
     @property
     def n_stops(self) -> int:
         return len(self.stops)
+
+    def delisting_breakdown(self) -> pd.DataFrame:
+        """Делистинги портфеля по типу исхода — с суммарным вкладом в капитал.
+
+        Вклад считается как доля капитала на момент события, умноженная на
+        доходность: позиция в 3.3% капитала, ушедшая в ноль, стоит бэктесту 3.3
+        процентных пункта, и просуммировать их по прогону — единственный способ
+        увидеть цену допущения ТЗ 4.1 в тех же единицах, что и результат.
+        """
+        if not self.delistings:
+            return pd.DataFrame(
+                columns=["событий", "вклад, пп"],
+                index=pd.Index([], name="исход"),
+            )
+        frame = pd.DataFrame(
+            self.delistings, columns=["date", "permaticker", "ret", "weight"]
+        )
+        frame["исход"] = pd.cut(
+            frame["ret"],
+            bins=[-1.001, -0.999, -0.10, 0.10, float("inf")],
+            labels=["полная потеря (−100%)", "убыток", "около нуля",
+                    "прибыль"],
+        )
+        grouped = frame.groupby("исход", observed=True).apply(
+            lambda g: pd.Series({
+                "событий": len(g),
+                "вклад, пп": 100.0 * float((g["weight"] * g["ret"]).sum()),
+            }),
+            include_groups=False,
+        )
+        return grouped
 
     @property
     def n_trades(self) -> int:
@@ -204,6 +241,7 @@ def run_backtest(
     quarantine: dict[int, pd.Timestamp] = {}
     stop_history: list[pd.Timestamp] = []
     stops_log: list[tuple[pd.Timestamp, int]] = []
+    delistings_log: list[tuple[pd.Timestamp, int, float, float]] = []
     throttled = 0
 
     previous_day: pd.Timestamp | None = None
@@ -219,10 +257,14 @@ def run_backtest(
             to_prices = panel.openadj if priced_at_open else closeadj
             positions = _revalue(positions, closeadj, to_prices, previous_day, today)
 
-            positions, cash, hits = _settle_delistings(
+            equity_before = sum(positions.values()) + cash
+            positions, cash, events = _settle_delistings(
                 positions, cash, last_alive, today, delisting_returns
             )
-            delisted_hits += hits
+            delisted_hits += len(events)
+            for permaticker, value, ret in events:
+                weight = value / equity_before if equity_before > 0 else 0.0
+                delistings_log.append((today, permaticker, ret, weight))
 
             if pending_stops:
                 positions, cash, executed, deferred = _execute_stops(
@@ -338,6 +380,7 @@ def run_backtest(
         universe_members=universe_members,
         trades=pd.Series(trades_log, name="trades", dtype="int64").sort_index(),
         stops=stops_log,
+        delistings=delistings_log,
         throttled=throttled,
     )
 
@@ -485,20 +528,24 @@ def _settle_delistings(
     last_alive: pd.Series,
     today: pd.Timestamp,
     delisting_returns: pd.Series,
-) -> tuple[dict[int, float], float, int]:
+) -> tuple[dict[int, float], float, list[tuple[int, float, float]]]:
     """Закрывает позиции по бумагам, которые перестали торговаться (ТЗ 4.1).
 
     Именно здесь банкротство превращается в −100%, а не в исчезновение строки.
     Остаток уходит в деньги и ждёт ближайшей ребалансировки.
+
+    Returns:
+        Выжившие позиции, деньги и список событий `(permaticker, стоимость до
+        закрытия, доходность)` — для разбора допущения ТЗ 4.1 в отчёте.
     """
     survivors: dict[int, float] = {}
-    hits = 0
+    events: list[tuple[int, float, float]] = []
     for permaticker, value in positions.items():
         last_day = last_alive.get(permaticker)
         if last_day is not None and pd.notna(last_day) and today > last_day:
             ret = float(delisting_returns.get(permaticker, DEFAULT_DELISTING_RETURN))
             cash += value * (1.0 + ret)
-            hits += 1
+            events.append((permaticker, value, ret))
         else:
             survivors[permaticker] = value
-    return survivors, cash, hits
+    return survivors, cash, events

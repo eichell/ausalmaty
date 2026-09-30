@@ -121,8 +121,9 @@ class Comparison:
             f"{'Волатильность':<24}{self.ours_volatility:>19.2%}"
             f"{self.reference_volatility:>12.2%}",
             "",
-            "По годам (%):",
-            self.yearly.to_string(float_format=lambda v: f"{v:7.2f}"),
+            "По годам (%); diff не считается для неполных лет:",
+            self.yearly.to_string(float_format=lambda v: f"{v:7.2f}",
+                                  na_rep="   —"),
         ]
         return "\n".join(lines)
 
@@ -238,6 +239,14 @@ def compare(
         "reference": _annual(b) * 100,
     })
     yearly["diff"] = yearly["ours"] - yearly["reference"]
+    # Неполный год обязан быть помечен. Первый месяц прогона в месячный ряд не
+    # попадает (доходность считается от предыдущего закрытия), и год начала
+    # выборки короче календарного. Без пометки такая строка читается как
+    # отставание стратегии от эталона, хотя это разная длина периода — и именно
+    # так я сам однажды прочитал 1999 год.
+    months = pd.Series(1, index=a.index).groupby(a.index.year).sum()
+    yearly["мес."] = months.reindex(yearly.index)
+    yearly.loc[yearly["мес."] < 12, "diff"] = float("nan")
 
     return Comparison(
         weighting=weighting,

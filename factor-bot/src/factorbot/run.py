@@ -453,6 +453,24 @@ def _print_regime_comparison(results: dict[bool, object], benchmark) -> None:
     print(f"{'Ребалансировок в защите':<28}{'—':>14}{share:>13.0%}")
 
 
+def _print_delistings(result) -> None:
+    """Разбор делистингов портфеля по исходу (ТЗ 4.1).
+
+    Печатается всегда, когда делистинги были. Это самое чувствительное допущение
+    проекта: больше половины ушедших бумаг не имеет данных об оплате и считается
+    как −100%. Пока цифра не стоит в отчёте, вопрос «сколько результата объясняется
+    допущением, а не стратегией» остаётся без ответа, — а однажды ответ был
+    «целиком», и заметить это удалось только по невозможному CAGR.
+    """
+    breakdown = result.delisting_breakdown()
+    if breakdown.empty:
+        return
+    print("   из них по исходу:")
+    for outcome, row in breakdown.iterrows():
+        print(f"     {outcome:<24}{int(row['событий']):>4} шт., "
+              f"вклад {row['вклад, пп']:+.2f} пп")
+
+
 def _print_report(args, result, net: M.Metrics, gross: M.Metrics, benchmark,
                   *, filtered: bool = False) -> None:
     suffix = " + режимный фильтр" if filtered else ""
@@ -472,6 +490,7 @@ def _print_report(args, result, net: M.Metrics, gross: M.Metrics, benchmark,
         print(f"Вселенная (медиана):     {median} бумаг  "
               f"(отбор на {len(filled)} датах{note})")
     print(f"Делистингов в портфеле:  {result.delisted_hits}")
+    _print_delistings(result)
     print(f"Сделок:                  {result.n_trades}")
     if result.n_stops:
         print(f"Сработало стоп-лоссов:   {result.n_stops}")
