@@ -324,3 +324,64 @@ def test_composite_differs_from_both_of_its_halves(db_with_reports):
     top_mixed = set(mixed.nlargest(6).index)
     assert top_mixed != set(z_mom.nlargest(6).index)
     assert top_mixed != set(z_val.nlargest(6).index)
+
+
+# --------------------------------------------------------------------------- #
+# Сохранение кривой прогона
+# --------------------------------------------------------------------------- #
+
+
+def test_run_saves_the_equity_curve_and_metrics(db, tmp_path):
+    """Без сохранённой кривой любой вопрос к прошлому прогону стоит нового прогона.
+
+    А каждый прогон дописывает строку в журнал испытаний (ТЗ 9.2.1) и ужесточает
+    поправку ТЗ 9.2.5. Платить испытанием за уже посчитанную цифру нельзя.
+    """
+    import json
+    from types import SimpleNamespace
+
+    from factorbot.run import save_curves
+
+    panel, securities = _open_panel(db)
+    result = _run(panel, securities, sign=1.0)
+    benchmark = pd.Series(dtype="float64")
+    args = SimpleNamespace(out=str(tmp_path), strategy="momentum", period="in_sample",
+                           regime="off", stops="off", note="проверка")
+    path = save_curves(args, result, M.summarize(result, benchmark), benchmark)
+
+    curves = pd.read_csv(path, index_col="date", parse_dates=["date"])
+    assert list(curves.columns) == ["equity_net", "equity_gross"]
+    # Сравнение с допуском: CSV пишет десятичное представление, а не байты float.
+    pd.testing.assert_series_equal(
+        curves["equity_net"], result.equity_net.rename("equity_net"),
+        check_freq=False, rtol=1e-9,
+    )
+
+    payload = json.loads((tmp_path / "metrics_momentum_in_sample.json").read_text("utf-8"))
+    assert payload["strategy"] == "momentum"
+    assert "cagr" in payload["metrics_net"]
+
+
+def test_saved_curve_carries_the_benchmark_when_there_is_one(db, tmp_path):
+    from types import SimpleNamespace
+
+    from factorbot.run import save_curves
+
+    panel, securities = _open_panel(db)
+    result = _run(panel, securities, sign=1.0)
+    benchmark = panel.closeadj.iloc[:, 0].rename("SPY")
+    args = SimpleNamespace(out=str(tmp_path), strategy="momentum", period="in_sample",
+                           regime="off", stops="off", note="")
+    path = save_curves(args, result, M.summarize(result, benchmark), benchmark)
+    assert "benchmark" in pd.read_csv(path).columns
+
+
+def test_overlays_show_up_in_the_file_name():
+    from types import SimpleNamespace
+
+    from factorbot.run import run_tag
+
+    assert run_tag(SimpleNamespace(strategy="composite", period="in_sample",
+                                   regime="on", stops="off")) == "composite_in_sample_regime"
+    assert run_tag(SimpleNamespace(strategy="value", period="validation",
+                                   regime="off", stops="on")) == "value_validation_stops"

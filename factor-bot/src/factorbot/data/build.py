@@ -60,7 +60,7 @@ def build_full_database(
         counts["securities"] = _insert(conn, "securities", securities)
 
         sep_map = sharadar.build_ticker_map(tickers_raw, "stocks")
-        sf1_map = sharadar.build_ticker_map(tickers_raw, "fundamentals")
+        sf1_map = sharadar.build_ticker_map(tickers_raw, sharadar.FUNDAMENTALS_TABLE)
 
         counts["prices"] = _insert_streamed(
             conn, "prices", provider, "stocks",
@@ -69,7 +69,7 @@ def build_full_database(
 
         # Фундаментал пишется только через pit.py (ТЗ 4.8).
         written = 0
-        for chunk in provider.iter_table("fundamentals", force=force):
+        for chunk in provider.iter_table(sharadar.FUNDAMENTALS_TABLE, force=force):
             written += pit.load_fundamentals(
                 conn, sharadar.normalize_sf1(chunk, sf1_map, strict=False)
             )
@@ -79,7 +79,7 @@ def build_full_database(
                 "(ТЗ 4.3): собирать value не из чего."
             )
         counts["fundamental_rows"] = written
-        log.info("fundamentals: записано %d строк", written)
+        log.info("%s: записано %d строк", sharadar.FUNDAMENTALS_TABLE, written)
 
         counts.update(load_funds(
             conn, provider, tickers_raw, instruments, force=force,

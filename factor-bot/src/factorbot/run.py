@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from dataclasses import dataclass, replace
@@ -190,6 +191,56 @@ def load_benchmark(conn, ticker: str) -> pd.Series:
     return df.set_index(pd.to_datetime(df["date"]))["closeadj"].rename(ticker)
 
 
+def run_tag(args) -> str:
+    """Имя прогона в файлах: стратегия, период и включённые оверлеи."""
+    parts = [args.strategy, args.period]
+    if args.regime in ("on", "both"):
+        parts.append("regime")
+    if args.stops in ("on", "both"):
+        parts.append("stops")
+    return "_".join(parts)
+
+
+def save_curves(args, result, metrics: M.Metrics, benchmark: pd.Series) -> Path:
+    """Сохраняет кривую эквити и метрики прогона на диск.
+
+    Пишется всегда, а не по флагу. Причина не в удобстве: без сохранённой кривой
+    любой вопрос к прошлому прогону — сверка с опубликованными результатами
+    (ТЗ 13.2), пересчёт Deflated Sharpe Ratio, сравнение двух версий — требует
+    прогнать бэктест заново. А каждый прогон дописывает строку в журнал испытаний
+    (ТЗ 9.2.1) и ужесточает поправку ТЗ 9.2.5. Платить испытанием за цифру,
+    которая уже была посчитана, — прямой путь к тому, чтобы поправка перестала
+    отражать реальное число проверенных гипотез.
+    """
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    tag = run_tag(args)
+
+    curves = pd.DataFrame({
+        "equity_net": result.equity_net,
+        "equity_gross": result.equity_gross,
+    })
+    if not benchmark.empty:
+        curves["benchmark"] = benchmark.reindex(curves.index)
+    path = out / f"equity_{tag}.csv"
+    curves.to_csv(path, index_label="date")
+
+    payload = {
+        "strategy": args.strategy,
+        "period": args.period,
+        "regime": args.regime,
+        "stops": args.stops,
+        "note": args.note,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "metrics_net": metrics.to_dict(),
+    }
+    (out / f"metrics_{tag}.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    log.info("Кривая и метрики прогона: %s", path)
+    return path
+
+
 def append_experiment(note: str, strategy: str, period: str, result_line: str) -> None:
     """Дописывает строку в журнал испытаний (ТЗ 9.2.1)."""
     line = (
@@ -287,6 +338,8 @@ def main(argv: list[str] | None = None) -> int:
         f"CAGR {net.cagr:.2%} (до издержек {gross.cagr:.2%}), Sharpe {net.sharpe:.2f}, "
         f"maxDD {net.max_drawdown:.1%}, оборот {net.annual_turnover:.0%}/год",
     )
+
+    save_curves(args, primary, net, benchmark)
 
     if args.plots:
         from factorbot.report import plots

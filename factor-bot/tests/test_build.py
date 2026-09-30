@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import duckdb
 import pandas as pd
@@ -293,5 +294,8 @@ def test_build_without_instruments_touches_nothing(built):
 
 
 def test_benchmark_list_comes_from_the_config_without_duplicates():
-    cfg = load_config("config/strategy.yaml")
+    # Путь от файла теста, а не от текущего каталога: pytest запускают и из
+    # корня репозитория, и из factor-bot/, и тест не должен зависеть от того,
+    # откуда его позвали.
+    cfg = load_config(Path(__file__).resolve().parents[1] / "config" / "strategy.yaml")
     assert benchmark_instruments(cfg) == ["SPY", "SHY"]
