@@ -2,8 +2,8 @@
 
 Два независимых слоя:
 
-*   `SharadarProvider` — сеть. Bulk-выгрузка через Nasdaq Data Link, кэш сырых
-    архивов на диске. Тянуть таблицы поштучно ТЗ 4.2 запрещает.
+*   `SharadarProvider` — сеть. Bulk-выгрузка через прямой API Sharadar, кэш
+    сырых архивов на диске. Тянуть таблицы поштучно ТЗ 4.2 запрещает.
 *   `normalize_*` — чистые функции над кадрами. Ни сети, ни файлов, ни базы,
     поэтому проверяемы на синтетике и не требуют ключа API.
 
@@ -11,6 +11,13 @@
 сопоставление ticker → permaticker всегда идёт с интервалом дат, а не по равенству
 строк: свободный символ достаётся другой компании, и join по `ticker` даст тихую
 склейку двух разных историй.
+
+Про адрес. ТЗ 4.2 называет эндпоинт Nasdaq Data Link, но Sharadar с тех пор
+продаёт данные напрямую, и ключ с sharadar.com в системе Nasdaq не работает —
+их документация предупреждает об этом отдельной строкой. Поэтому здесь прямой
+API. Имена таблиц у него свои (`fundamentals`, `stocks`), а прежние коды `SF1` и
+`SEP` остались псевдонимами; в коде используются современные имена, чтобы
+сообщения об ошибках совпадали с документацией поставщика.
 """
 
 from __future__ import annotations
@@ -31,19 +38,25 @@ from factorbot.data.provider import DataProvider
 
 log = logging.getLogger(__name__)
 
-API_ROOT = "https://data.nasdaq.com/api/v3/datatables/SHARADAR"
+API_ROOT = "https://api.sharadar.com/v1.0"
 
-#: Таблицы из ТЗ 4.2. DAILY — только контрольный источник (ТЗ 4.4).
-TABLES: tuple[str, ...] = ("SF1", "SEP", "TICKERS", "ACTIONS", "DAILY")
+#: Таблицы ТЗ 4.2 в именах прямого API. В скобках прежние коды: fundamentals =
+#: SF1, stocks = SEP. `daily` — только контрольный источник (ТЗ 4.4).
+TABLES: tuple[str, ...] = ("tickers", "stocks", "fundamentals", "actions", "daily")
 
 #: Без этих трёх не собирается ничего: справочник задаёт вселенную и карту
-#: permaticker, SEP даёт momentum, SF1 — value.
-REQUIRED_TABLES: tuple[str, ...] = ("TICKERS", "SEP", "SF1")
+#: permaticker, stocks даёт momentum, fundamentals — value.
+REQUIRED_TABLES: tuple[str, ...] = ("tickers", "stocks", "fundamentals")
 
-#: ACTIONS нужна для корректных delisting returns (ТЗ 4.1), DAILY — только для
-#: сверки (ТЗ 4.4). Их отсутствие на урезанном тарифе не должно ронять загрузку,
-#: но обязано быть видно: без ACTIONS результат бэктеста завышен систематически.
-OPTIONAL_TABLES: tuple[str, ...] = ("ACTIONS", "DAILY")
+#: `actions` нужна для корректных delisting returns (ТЗ 4.1), `daily` — только
+#: для сверки (ТЗ 4.4). Их отсутствие на урезанном тарифе не должно ронять
+#: загрузку, но обязано быть видно: без actions результат завышен систематически.
+OPTIONAL_TABLES: tuple[str, ...] = ("actions", "daily")
+
+#: Глубина выгрузки. Протокол ТЗ 9.1 требует истории с 1998 года, поэтому здесь
+#: только "full"; значения "5" и "10" оставлены на случай урезанной подписки —
+#: с ними раздел 9 придётся переписывать, и это должно быть видно в конфиге.
+DEFAULT_YEARS = "full"
 
 #: Измерения SF1, которые вообще попадают в базу (ТЗ 4.3). MR* отбрасываются
 #: на загрузке, а не на выборке: то, чего нет в файле, нельзя прочитать по ошибке.
@@ -64,10 +77,13 @@ class SubscriptionError(SharadarError):
 class RateLimitError(SharadarError):
     """Превышена частота запросов. В отличие от тарифа, проходит само — но не сразу.
 
-    Бесплатный ключ Nasdaq Data Link держит десятки запросов в сутки, и при
-    превышении аккаунт временно отключается целиком, а не отдельный эндпоинт.
-    Долбить его после этого бессмысленно и вредно: счётчик продлевается.
+    Долбить поставщика после такого ответа бессмысленно и вредно: счётчик
+    продлевается, и разбираться потом приходится часами.
     """
+
+
+class AuthError(SharadarError):
+    """Ключ не принят. Повтор не поможет, нужен другой ключ."""
 
 
 @dataclass(frozen=True)
@@ -95,23 +111,37 @@ class SharadarProvider(DataProvider):
     """Bulk-выгрузка таблиц Sharadar с кэшем на диске.
 
     Args:
-        api_key: ключ Nasdaq Data Link. По умолчанию из NASDAQ_DATA_LINK_API_KEY.
-        cache_dir: куда складывать сырые CSV-архивы.
-        max_wait_s: сколько ждать, пока поставщик соберёт снимок таблицы.
+        api_key: ключ с sharadar.com. По умолчанию из SHARADAR_API_KEY; ради
+            совместимости принимается и прежнее имя NASDAQ_DATA_LINK_API_KEY.
+        cache_dir: куда складывать сырые архивы.
+        years: глубина выгрузки, "full" по умолчанию (ТЗ 9.1).
     """
 
     api_key: str | None = None
     cache_dir: Path = Path("data/raw")
-    max_wait_s: int = 900
-    poll_interval_s: int = 15
-    #: Пауза между проверками таблиц. Бесплатный ключ отключается целиком, если
-    #: выпустить пять запросов подряд, и разбираться потом приходится часами.
+    years: str = DEFAULT_YEARS
+    #: Полная история цен — сотни мегабайт, и скачивание идёт минутами.
+    timeout_s: int = 1800
+    #: Пауза между проверками таблиц: пять запросов подряд поставщику не нравятся.
     probe_interval_s: float = 2.0
     name: str = "sharadar"
 
     def __post_init__(self) -> None:
-        self.api_key = self.api_key or os.environ.get("NASDAQ_DATA_LINK_API_KEY")
+        self.api_key = (
+            self.api_key
+            or os.environ.get("SHARADAR_API_KEY")
+            or os.environ.get("NASDAQ_DATA_LINK_API_KEY")
+        )
         self.cache_dir = Path(self.cache_dir)
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        """Ключ уходит заголовком, а не в строке запроса.
+
+        В URL он попал бы в логи прокси, в историю команд и в текст исключений
+        requests. Заголовок этого не делает.
+        """
+        return {"x-api-key": self.api_key or ""}
 
     def available_tables(self) -> tuple[str, ...]:
         return TABLES
@@ -124,21 +154,19 @@ class SharadarProvider(DataProvider):
         cached = self._cached_path(table)
         if cached is not None and not force:
             log.info("%s: беру из кэша %s", table, cached)
-            return _read_csv_zip(cached.read_bytes())
+            return _read_csv_zip(cached)
 
         if not self.api_key:
             raise SharadarError(
-                f"Нет ключа Nasdaq Data Link и нет кэша для {table}. "
-                "Задайте NASDAQ_DATA_LINK_API_KEY или положите архив в "
-                f"{self.cache_dir / table}."
+                f"Нет ключа Sharadar и нет кэша для {table}. Задайте "
+                f"SHARADAR_API_KEY или положите архив в {self.cache_dir / table}."
             )
 
-        blob = self._download_bulk(table)
         target = self.cache_dir / table / f"{date.today().isoformat()}.zip"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(blob)
-        log.info("%s: сохранено в %s (%.1f МБ)", table, target, len(blob) / 1e6)
-        return _read_csv_zip(blob)
+        self._download_bulk(table, target)
+        log.info("%s: сохранено в %s (%.1f МБ)", table, target,
+                 target.stat().st_size / 1e6)
+        return _read_csv_zip(target)
 
     def _cached_path(self, table: str) -> Path | None:
         d = self.cache_dir / table
@@ -150,15 +178,16 @@ class SharadarProvider(DataProvider):
     def probe_table(self, table: str) -> TableAccess:
         """Одна строка из таблицы — дёшево и достаточно, чтобы узнать про тариф.
 
-        Урезанный ключ отвечает 403 с внятным текстом. Проверять это до запуска
-        суточной загрузки полезнее, чем узнавать на четвёртой таблице.
+        Проверять это до запуска многочасовой загрузки полезнее, чем узнавать
+        на четвёртой таблице.
         """
         if not self.api_key:
-            return TableAccess(table, False, None, "не задан NASDAQ_DATA_LINK_API_KEY")
+            return TableAccess(table, False, None, "не задан SHARADAR_API_KEY")
         try:
             r = requests.get(
-                f"{API_ROOT}/{table}.json",
-                params={"api_key": self.api_key, "qopts.per_page": 1},
+                f"{API_ROOT}/data/{table}",
+                params={"limit": 1},
+                headers=self._headers,
                 timeout=60,
             )
         except requests.RequestException as exc:
@@ -167,19 +196,22 @@ class SharadarProvider(DataProvider):
         if r.ok:
             return TableAccess(table, True, r.status_code)
 
-        detail = _quandl_error(r)
-        if _is_rate_limited(r, detail):
+        detail = _api_error(r)
+        if r.status_code == 429:
             raise RateLimitError(detail)
+        if r.status_code == 401:
+            raise AuthError(detail)
         return TableAccess(table, False, r.status_code, detail)
 
     def check_access(self) -> dict[str, TableAccess]:
         """Проверяет тариф ключа по всем таблицам ТЗ 4.2.
 
-        Между запросами стоит пауза, а при отказе по частоте проверка
-        прекращается: продолжать значит продлевать блокировку.
+        Между запросами стоит пауза, а при отказе по частоте или по ключу
+        проверка прекращается: продолжать бессмысленно.
 
         Raises:
-            RateLimitError: ключ временно отключён поставщиком.
+            RateLimitError: поставщик временно отказывает по частоте.
+            AuthError: ключ не принят.
         """
         access: dict[str, TableAccess] = {}
         for i, table in enumerate(TABLES):
@@ -188,63 +220,72 @@ class SharadarProvider(DataProvider):
             access[table] = self.probe_table(table)
         return access
 
-    def _download_bulk(self, table: str) -> bytes:
-        """Снимок таблицы целиком: qopts.export=true, затем ожидание готовности."""
-        url = f"{API_ROOT}/{table}.json"
-        params = {"qopts.export": "true", "api_key": self.api_key}
-        deadline = time.monotonic() + self.max_wait_s
+    def _download_bulk(self, table: str, target: Path) -> None:
+        """Скачивает снимок таблицы целиком (ТЗ 4.2).
 
-        while True:
-            r = requests.get(url, params=params, timeout=60)
-            if r.status_code == 403:
-                raise SubscriptionError(
-                    f"{table}: ключ не даёт доступа к таблице. {_quandl_error(r)}"
-                )
-            if r.status_code == 429:
-                # Лимит запросов поставщика. Ждать дешевле, чем падать посреди
-                # суточной загрузки пяти таблиц.
-                time.sleep(self.poll_interval_s)
-                continue
-            r.raise_for_status()
-            file_info = r.json().get("datatable_bulk_download", {}).get("file", {})
-            status, link = file_info.get("status"), file_info.get("link")
+        Запрос с `years` отвечает редиректом на подписанную ссылку в хранилище
+        поставщика; `requests` идёт по нему сам. Файл пишется потоком во
+        временный и переименовывается только после успеха: оборванная закачка не
+        должна остаться в кэше под видом готового архива.
+        """
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_suffix(".part")
 
-            if status == "fresh" and link:
-                blob = requests.get(link, timeout=600)
-                blob.raise_for_status()
-                return blob.content
+        with requests.get(
+            f"{API_ROOT}/data/{table}",
+            params={"years": self.years},
+            headers=self._headers,
+            timeout=self.timeout_s,
+            stream=True,
+        ) as r:
+            self._raise_for_status(r, table)
+            written = 0
+            with partial.open("wb") as fh:
+                for chunk in r.iter_content(chunk_size=1 << 20):
+                    fh.write(chunk)
+                    written += len(chunk)
+                    if written % (64 << 20) < (1 << 20):
+                        log.info("%s: скачано %.0f МБ", table, written / 1e6)
 
-            if time.monotonic() > deadline:
-                raise SharadarError(
-                    f"{table}: снимок не готов за {self.max_wait_s} с (статус {status!r})."
-                )
-            log.info("%s: снимок в статусе %s, жду %s с", table, status, self.poll_interval_s)
-            time.sleep(self.poll_interval_s)
+        if partial.stat().st_size == 0:
+            partial.unlink(missing_ok=True)
+            raise SharadarError(f"{table}: поставщик вернул пустой файл.")
+        partial.replace(target)
+
+    def _raise_for_status(self, r: requests.Response, table: str) -> None:
+        if r.ok:
+            return
+        detail = _api_error(r)
+        if r.status_code == 401:
+            raise AuthError(f"{table}: ключ не принят. {detail}")
+        if r.status_code == 429:
+            raise RateLimitError(f"{table}: {detail}")
+        if r.status_code == 403:
+            raise SubscriptionError(
+                f"{table}: нет доступа по подписке. {detail} "
+                "Проверьте тариф на https://sharadar.com/account"
+            )
+        r.raise_for_status()
 
 
-#: Код Nasdaq Data Link для превышения частоты запросов.
-RATE_LIMIT_CODE = "QELx06"
-
-
-def _is_rate_limited(response: requests.Response, detail: str) -> bool:
-    return response.status_code == 429 or RATE_LIMIT_CODE in detail
-
-
-def _quandl_error(response: requests.Response) -> str:
-    """Достаёт текст ошибки поставщика; при неразборчивом ответе — код и начало тела."""
+def _api_error(response: requests.Response) -> str:
+    """Текст ошибки поставщика; при неразборчивом ответе — код и начало тела."""
     try:
-        err = response.json().get("quandl_error", {})
-        message = err.get("message")
-        if message:
-            return f"{err.get('code', '')} {message}".strip()
+        payload = response.json()
     except ValueError:
-        pass
-    return f"HTTP {response.status_code}: {response.text[:200]}"
+        return f"HTTP {response.status_code}: {response.text[:200]}"
+
+    if isinstance(payload, dict):
+        for key in ("message", "error", "detail"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return f"HTTP {response.status_code}: {str(payload)[:200]}"
 
 
-def _read_csv_zip(blob: bytes) -> pd.DataFrame:
+def _read_csv_zip(archive: Path) -> pd.DataFrame:
     """Bulk-выгрузка приходит zip-архивом с одним CSV внутри."""
-    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+    with zipfile.ZipFile(archive) as z:
         names = [n for n in z.namelist() if n.lower().endswith(".csv")]
         if len(names) != 1:
             raise SharadarError(f"В архиве ожидался один CSV, найдено: {names}")
@@ -257,6 +298,24 @@ def _read_csv_zip(blob: bytes) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 
+#: Прежние коды таблиц и новые имена указывают на одни и те же данные.
+TABLE_ALIASES: dict[str, set[str]] = {
+    "stocks": {"stocks", "sep"},
+    "fundamentals": {"fundamentals", "sf1"},
+    "actions": {"actions"},
+    "daily": {"daily"},
+    "tickers": {"tickers"},
+}
+
+
+def _table_aliases(table: str) -> set[str]:
+    key = table.lower()
+    for name, aliases in TABLE_ALIASES.items():
+        if key == name or key in aliases:
+            return aliases
+    return {key}
+
+
 def build_ticker_map(tickers_raw: pd.DataFrame, source_table: str) -> pd.DataFrame:
     """Интервальная карта ticker → permaticker для одной исходной таблицы.
 
@@ -267,11 +326,15 @@ def build_ticker_map(tickers_raw: pd.DataFrame, source_table: str) -> pd.DataFra
     Returns:
         Кадр с колонками ticker, permaticker, valid_from, valid_to.
     """
-    df = tickers_raw.loc[tickers_raw["table"].str.upper() == source_table.upper()].copy()
+    wanted = _table_aliases(source_table)
+    df = tickers_raw.loc[tickers_raw["table"].str.lower().isin(wanted)].copy()
     if df.empty:
         raise SharadarError(f"В TICKERS нет строк для таблицы {source_table!r}.")
 
-    if source_table.upper() == "SF1":
+    # Для отчётности окно владения символом задаётся кварталами, для цен —
+    # датами котировок. Прежние коды SF1/SEP принимаются наравне с новыми
+    # именами: в документации поставщика они остались первоклассными.
+    if source_table.lower() in ("fundamentals", "sf1"):
         lo, hi = "firstquarter", "lastquarter"
     else:
         lo, hi = "firstpricedate", "lastpricedate"
@@ -346,8 +409,10 @@ def attach_permaticker(
 
 
 def normalize_tickers(tickers_raw: pd.DataFrame) -> pd.DataFrame:
-    """TICKERS → securities. Одна строка на permaticker."""
-    df = tickers_raw.loc[tickers_raw["table"].str.upper() == "SEP"].copy()
+    """`tickers` → securities. Одна строка на permaticker."""
+    df = tickers_raw.loc[
+        tickers_raw["table"].str.lower().isin(_table_aliases("stocks"))
+    ].copy()
     out = pd.DataFrame({
         "permaticker": pd.to_numeric(df["permaticker"], errors="coerce").astype("Int64"),
         "ticker": df["ticker"].astype("string"),
@@ -395,8 +460,9 @@ def normalize_sf1(sf1_raw: pd.DataFrame, tmap: pd.DataFrame) -> pd.DataFrame:
     балансовые. Так одна строка не может смешать TTM-прибыль с балансом другого
     квартала, а факторный код не обязан помнить, откуда какое поле.
 
-    `available_from` = `datekey`. `lastupdated` не участвует (ТЗ 4.3): это момент
-    правки записи у поставщика, а не публичного раскрытия.
+    `available_from` = `date` (прежний `datekey`) — дата подачи формы в SEC.
+    `lastupdated` не участвует (ТЗ 4.3): это момент правки записи у поставщика,
+    а не публичного раскрытия.
 
     Знак `capex_ttm` сохраняется как у поставщика — отток отрицателен. Формула FCF
     в ТЗ 6.2 записана для положительного capex; см. README, раздел отклонений.
@@ -415,7 +481,9 @@ def normalize_sf1(sf1_raw: pd.DataFrame, tmap: pd.DataFrame) -> pd.DataFrame:
         "dimension": df["dimension"],
         "reportperiod": df["reportperiod"].dt.date,
         "calendardate": pd.to_datetime(df["calendardate"], errors="coerce").dt.date,
-        "available_from": pd.to_datetime(df["datekey"], errors="coerce").dt.date,
+        # В прямом API поле называется `date`, и это прежний `datekey`: словарь
+        # полей поставщика определяет его как «SEC filing date for AR dimensions».
+        "available_from": pd.to_datetime(df["date"], errors="coerce").dt.date,
     })
 
     is_flow = out["dimension"] == "ART"
@@ -430,7 +498,7 @@ def normalize_sf1(sf1_raw: pd.DataFrame, tmap: pd.DataFrame) -> pd.DataFrame:
     # можно увидеть, а значит нельзя использовать никогда.
     missing_key = out["available_from"].isna()
     if missing_key.any():
-        log.warning("Отброшено строк SF1 без datekey: %d", int(missing_key.sum()))
+        log.warning("Отброшено строк отчётности без даты подачи: %d", int(missing_key.sum()))
         out = out.loc[~missing_key]
 
     return out.reset_index(drop=True)

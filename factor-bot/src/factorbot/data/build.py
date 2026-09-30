@@ -52,21 +52,21 @@ def build_full_database(
     try:
         create_all(conn)
 
-        tickers_raw = provider.fetch_table("TICKERS", force=force)
+        tickers_raw = provider.fetch_table("tickers", force=force)
         securities = sharadar.normalize_tickers(tickers_raw)
         counts["securities"] = _insert(conn, "securities", securities)
 
-        sep_map = sharadar.build_ticker_map(tickers_raw, "SEP")
-        sf1_map = sharadar.build_ticker_map(tickers_raw, "SF1")
+        sep_map = sharadar.build_ticker_map(tickers_raw, "stocks")
+        sf1_map = sharadar.build_ticker_map(tickers_raw, "fundamentals")
 
-        prices = sharadar.normalize_sep(provider.fetch_table("SEP", force=force), sep_map)
+        prices = sharadar.normalize_sep(provider.fetch_table("stocks", force=force), sep_map)
         counts["prices"] = _insert(conn, "prices", prices)
 
         # Фундаментал пишется только через pit.py (ТЗ 4.8).
-        sf1 = sharadar.normalize_sf1(provider.fetch_table("SF1", force=force), sf1_map)
+        sf1 = sharadar.normalize_sf1(provider.fetch_table("fundamentals", force=force), sf1_map)
         counts["fundamental_rows"] = pit.load_fundamentals(conn, sf1)
 
-        actions_raw = _fetch_optional(provider, "ACTIONS", force=force)
+        actions_raw = _fetch_optional(provider, "actions", force=force)
         if actions_raw is not None:
             counts["corp_actions"] = _insert(
                 conn, "corp_actions", sharadar.normalize_actions(actions_raw, sep_map)
@@ -74,12 +74,12 @@ def build_full_database(
         else:
             counts["corp_actions"] = 0
             log.warning(
-                "ACTIONS недоступна: delisting returns считать не из чего (ТЗ 4.1). "
+                "actions недоступна: delisting returns считать не из чего (ТЗ 4.1). "
                 "Бэктест на такой базе завышает доходность value-стратегии."
             )
 
         if load_daily_control:
-            daily_raw = _fetch_optional(provider, "DAILY", force=force)
+            daily_raw = _fetch_optional(provider, "daily", force=force)
             counts["daily_control"] = (
                 _insert(conn, "daily_control", sharadar.normalize_daily(daily_raw, sep_map))
                 if daily_raw is not None else 0
@@ -110,7 +110,7 @@ def preflight(provider: sharadar.SharadarProvider) -> dict[str, sharadar.TableAc
     if missing:
         raise sharadar.SubscriptionError(
             f"Без этих таблиц собирать нечего: {missing}. "
-            "Нужен ключ Nasdaq Data Link с подпиской на Sharadar Core US Equities."
+            "Проверьте подписку на https://sharadar.com/account"
         )
     return access
 

@@ -25,12 +25,12 @@ SEP_RAW = pd.DataFrame([
 
 SF1_RAW = pd.DataFrame([
     {"ticker": "AAA", "dimension": "ART", "reportperiod": "2004-06-30",
-     "calendardate": "2004-06-30", "datekey": "2004-08-10", "lastupdated": "2019-01-01",
+     "calendardate": "2004-06-30", "date": "2004-08-10", "lastupdated": "2019-01-01",
      "revenue": 5000.0, "netinc": 412.0, "ncfo": 600.0, "capex": -150.0,
      "equity": 1000.0, "debt": 300.0, "cashneq": 120.0, "assets": 2200.0,
      "sharesbas": 50.0},
     {"ticker": "AAA", "dimension": "MRT", "reportperiod": "2004-06-30",
-     "calendardate": "2004-06-30", "datekey": "2004-08-10", "lastupdated": "2019-01-01",
+     "calendardate": "2004-06-30", "date": "2004-08-10", "lastupdated": "2019-01-01",
      "revenue": 9999.0, "netinc": 9999.0, "ncfo": 1.0, "capex": -1.0,
      "equity": 1.0, "debt": 1.0, "cashneq": 1.0, "assets": 1.0, "sharesbas": 1.0},
 ])
@@ -47,8 +47,8 @@ DAILY_RAW = pd.DataFrame([
 
 class FakeProvider(DataProvider):
     name = "fake"
-    _tables = {"TICKERS": TICKERS_RAW, "SEP": SEP_RAW, "SF1": SF1_RAW,
-               "ACTIONS": ACTIONS_RAW, "DAILY": DAILY_RAW}
+    _tables = {"tickers": TICKERS_RAW, "stocks": SEP_RAW, "fundamentals": SF1_RAW,
+               "actions": ACTIONS_RAW, "daily": DAILY_RAW}
 
     def available_tables(self):
         return tuple(self._tables)
@@ -111,7 +111,7 @@ class RestrictedProvider(FakeProvider):
     """Ключ без подписки на ACTIONS и DAILY — типичный бесплатный тариф."""
 
     name = "restricted"
-    forbidden = {"ACTIONS", "DAILY"}
+    forbidden = {"actions", "daily"}
 
     def fetch_table(self, table: str, *, force: bool = False) -> pd.DataFrame:
         if table in self.forbidden:
@@ -143,14 +143,14 @@ class _Access:
 
 
 def test_preflight_passes_when_the_required_tables_are_there():
-    access = preflight(_Access({"ACTIONS": False, "DAILY": False}))
-    assert access["SEP"].ok
-    assert not access["ACTIONS"].ok
+    access = preflight(_Access({"actions": False, "daily": False}))
+    assert access["stocks"].ok
+    assert not access["actions"].ok
 
 
 def test_preflight_refuses_to_start_without_the_required_tables():
-    with pytest.raises(sharadar.SubscriptionError, match="Sharadar Core"):
-        preflight(_Access({"SF1": False}))
+    with pytest.raises(sharadar.SubscriptionError, match="sharadar.com"):
+        preflight(_Access({"fundamentals": False}))
 
 
 # --------------------------------------------------------------------------- #
@@ -213,6 +213,7 @@ def test_probe_without_a_key_says_so_instead_of_calling_out(monkeypatch):
     окружения. Раньше этот тест делал настоящий запрос к поставщику боевым
     ключом и расходовал его лимит.
     """
+    monkeypatch.delenv("SHARADAR_API_KEY", raising=False)
     monkeypatch.delenv("NASDAQ_DATA_LINK_API_KEY", raising=False)
 
     def forbidden(*args, **kwargs):
@@ -221,6 +222,6 @@ def test_probe_without_a_key_says_so_instead_of_calling_out(monkeypatch):
     monkeypatch.setattr(sharadar.requests, "get", forbidden)
 
     provider = sharadar.SharadarProvider(api_key="", probe_interval_s=0)
-    state = provider.probe_table("SEP")
+    state = provider.probe_table("stocks")
     assert not state.ok
-    assert "NASDAQ_DATA_LINK_API_KEY" in state.detail
+    assert "SHARADAR_API_KEY" in state.detail

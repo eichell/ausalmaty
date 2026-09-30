@@ -14,22 +14,22 @@ from factorbot.data import sharadar
 
 TICKERS_RAW = pd.DataFrame([
     # table, permaticker, ticker, окна владения символом
-    {"table": "SEP", "permaticker": 1001, "ticker": "AAA", "name": "Alpha Corp",
+    {"table": "stocks", "permaticker": 1001, "ticker": "AAA", "name": "Alpha Corp",
      "exchange": "NYSE", "sector": "Technology", "industry": "Software",
      "siccode": "7372", "category": "Domestic Common Stock", "isdelisted": "Y",
      "firstpricedate": "1999-01-04", "lastpricedate": "2005-12-30",
      "firstquarter": "1999-03-31", "lastquarter": "2005-09-30"},
-    {"table": "SEP", "permaticker": 2002, "ticker": "AAA", "name": "Anew Inc",
+    {"table": "stocks", "permaticker": 2002, "ticker": "AAA", "name": "Anew Inc",
      "exchange": "NASDAQ", "sector": "Healthcare", "industry": "Biotech",
      "siccode": "2836", "category": "Domestic Common Stock", "isdelisted": "N",
      "firstpricedate": "2007-01-03", "lastpricedate": "",
      "firstquarter": "2007-03-31", "lastquarter": ""},
-    {"table": "SF1", "permaticker": 1001, "ticker": "AAA", "name": "Alpha Corp",
+    {"table": "fundamentals", "permaticker": 1001, "ticker": "AAA", "name": "Alpha Corp",
      "exchange": "NYSE", "sector": "Technology", "industry": "Software",
      "siccode": "7372", "category": "Domestic Common Stock", "isdelisted": "Y",
      "firstpricedate": "1999-01-04", "lastpricedate": "2005-12-30",
      "firstquarter": "1999-03-31", "lastquarter": "2005-09-30"},
-    {"table": "SF1", "permaticker": 2002, "ticker": "AAA", "name": "Anew Inc",
+    {"table": "fundamentals", "permaticker": 2002, "ticker": "AAA", "name": "Anew Inc",
      "exchange": "NASDAQ", "sector": "Healthcare", "industry": "Biotech",
      "siccode": "2836", "category": "Domestic Common Stock", "isdelisted": "N",
      "firstpricedate": "2007-01-03", "lastpricedate": "",
@@ -54,6 +54,7 @@ def test_open_interval_for_still_listed_company(sep_map):
 
 
 def test_sf1_map_uses_quarter_window_not_price_window():
+    """Прежний код SF1 принимается наравне с новым именем таблицы."""
     m = sharadar.build_ticker_map(TICKERS_RAW, "SF1")
     row = m.loc[m["permaticker"] == 1001].iloc[0]
     assert row["valid_to"] == pd.Timestamp("2005-09-30")
@@ -131,7 +132,7 @@ def test_prices_are_deduplicated_per_day(sep_map):
 def _sf1_row(dimension="ART", **over):
     row = {
         "ticker": "AAA", "dimension": dimension, "reportperiod": "2004-06-30",
-        "calendardate": "2004-06-30", "datekey": "2004-08-10", "lastupdated": "2019-01-01",
+        "calendardate": "2004-06-30", "date": "2004-08-10", "lastupdated": "2019-01-01",
         "revenue": 5000.0, "netinc": 412.0, "ncfo": 600.0, "capex": -150.0,
         "equity": 1000.0, "debt": 300.0, "cashneq": 120.0, "assets": 2200.0,
         "sharesbas": 50.0,
@@ -166,14 +167,15 @@ def test_most_recent_reported_rows_never_reach_the_database(sf1_map):
     assert set(out["dimension"]) == {"ART"}
 
 
-def test_available_from_is_datekey_not_lastupdated(sf1_map):
-    """`lastupdated` — момент правки у поставщика, а не публичного раскрытия."""
+def test_available_from_is_the_filing_date_not_lastupdated(sf1_map):
+    """`date` — дата подачи формы в SEC (прежний `datekey`). `lastupdated` — это
+    момент правки записи у поставщика, и в фильтрации он не участвует (ТЗ 4.3)."""
     out = sharadar.normalize_sf1(pd.DataFrame([_sf1_row()]), sf1_map)
     assert str(out.iloc[0]["available_from"]) == "2004-08-10"
 
 
 def test_row_without_disclosure_date_is_unusable_and_dropped(sf1_map):
-    raw = pd.DataFrame([_sf1_row(), _sf1_row(reportperiod="2004-03-31", datekey=None)])
+    raw = pd.DataFrame([_sf1_row(), _sf1_row(reportperiod="2004-03-31", date=None)])
     out = sharadar.normalize_sf1(raw, sf1_map)
     assert len(out) == 1
 

@@ -99,7 +99,8 @@ def isolated_environment(monkeypatch):
     """
     monkeypatch.setattr(os, "environ", dict(os.environ))
     for key in (
-        "NASDAQ_DATA_LINK_API_KEY", "ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY",
+        "SHARADAR_API_KEY", "NASDAQ_DATA_LINK_API_KEY",
+        "ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY",
         "FACTORBOT_UNLOCK_HOLDOUT",
     ):
         os.environ.pop(key, None)
