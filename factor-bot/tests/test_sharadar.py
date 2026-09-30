@@ -207,3 +207,64 @@ def test_securities_ignores_rows_of_other_source_tables():
     """SF1-строки справочника не должны удваивать вселенную."""
     out = sharadar.normalize_tickers(TICKERS_RAW)
     assert out["permaticker"].duplicated().sum() == 0
+
+
+# --------------------------------------------------------------------------- #
+# funds (SFP) → бенчмарк и защитный актив
+# --------------------------------------------------------------------------- #
+
+FUND_TICKERS_RAW = pd.DataFrame([
+    {"table": "funds", "permaticker": 118691, "ticker": "SPY",
+     "name": "SPDR S&P 500 ETF TRUST", "exchange": "NYSEARCA", "sector": "",
+     "industry": "", "siccode": "", "category": "ETF", "isdelisted": "N",
+     "firstpricedate": "1997-12-31", "lastpricedate": "",
+     "firstquarter": "", "lastquarter": ""},
+    {"table": "funds", "permaticker": 118012, "ticker": "SHY",
+     "name": "ISHARES 1-3 YEAR TREASURY BOND ETF", "exchange": "NASDAQ", "sector": "",
+     "industry": "", "siccode": "", "category": "ETF", "isdelisted": "N",
+     "firstpricedate": "2002-07-30", "lastpricedate": "",
+     "firstquarter": "", "lastquarter": ""},
+])
+
+ALL_TICKERS_RAW = pd.concat([TICKERS_RAW, FUND_TICKERS_RAW], ignore_index=True)
+
+
+def test_fund_securities_are_taken_from_the_fund_part_of_the_directory():
+    """Акции и фонды лежат в разных таблицах справочника, и путать их нельзя."""
+    out = sharadar.normalize_tickers(
+        ALL_TICKERS_RAW, source_table="funds", only=["SPY", "SHY"]
+    )
+    assert sorted(out["ticker"]) == ["SHY", "SPY"]
+    assert set(out["category"]) == {"ETF"}
+
+
+def test_stock_securities_never_include_funds():
+    """Иначе ETF попадут во вселенную ТЗ 5 через чёрный ход."""
+    out = sharadar.normalize_tickers(ALL_TICKERS_RAW)
+    assert 118691 not in set(out["permaticker"])
+
+
+def test_unknown_benchmark_ticker_is_an_error_not_an_empty_frame():
+    """Опечатка в конфиге обязана остановить сборку, а не тихо убрать бенчмарк."""
+    with pytest.raises(sharadar.SharadarError, match="SPZ"):
+        sharadar.normalize_tickers(
+            ALL_TICKERS_RAW, source_table="funds", only=["SPY", "SPZ"]
+        )
+
+
+def test_fund_prices_normalize_to_the_same_price_schema():
+    fund_map = sharadar.build_ticker_map(ALL_TICKERS_RAW, "funds")
+    raw = pd.DataFrame([{
+        "ticker": "SPY", "date": "2004-06-01", "open": 111.0, "high": 112.0,
+        "low": 110.0, "close": 111.5, "closeadj": 80.0, "closeunadj": 111.5,
+        "volume": 50_000_000.0,
+    }])
+    out = sharadar.normalize_funds(raw, fund_map)
+    assert out.iloc[0]["permaticker"] == 118691
+    assert out.iloc[0]["closeadj"] == pytest.approx(80.0)
+    assert out.iloc[0]["dollar_volume"] == pytest.approx(111.5 * 50_000_000.0)
+
+
+def test_sfp_is_accepted_as_an_alias_of_funds():
+    """Документация поставщика до сих пор пользуется прежним кодом."""
+    assert sharadar._table_aliases("sfp") == sharadar._table_aliases("funds")

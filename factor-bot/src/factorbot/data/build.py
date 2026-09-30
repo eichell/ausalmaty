@@ -19,10 +19,11 @@ from datetime import date
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 
 from factorbot.config import load_config, load_dotenv
 from factorbot.data import pit, sharadar
-from factorbot.data.periods import split_database
+from factorbot.data.periods import PERIODS, period_path, split_database
 from factorbot.data.schema import create_all
 
 log = logging.getLogger("factorbot.build")
@@ -32,6 +33,7 @@ def build_full_database(
     provider: sharadar.SharadarProvider,
     db_path: str | Path,
     *,
+    instruments: list[str] | None = None,
     load_daily_control: bool = True,
     force: bool = False,
 ) -> dict[str, int]:
@@ -42,6 +44,7 @@ def build_full_database(
     логе предупреждением: без `ACTIONS` банкротство выглядит как исчезновение из
     выборки, а не как −100%, и результат завышается систематически.
     """
+    instruments = list(instruments or [])
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if db_path.exists():
@@ -78,6 +81,10 @@ def build_full_database(
         counts["fundamental_rows"] = written
         log.info("fundamentals: записано %d строк", written)
 
+        counts.update(load_funds(
+            conn, provider, tickers_raw, instruments, force=force,
+        ))
+
         actions_raw = _fetch_optional(provider, "actions", force=force)
         if actions_raw is not None:
             counts["corp_actions"] = _insert(
@@ -98,6 +105,114 @@ def build_full_database(
             )
     finally:
         conn.close()
+
+    return counts
+
+
+def benchmark_instruments(cfg) -> list[str]:
+    """Тикеры, которые нужны вне вселенной: бенчмарк и защитный актив.
+
+    Берутся из конфига, а не из списка в коде: если в ТЗ 7.1 поменяется защитный
+    актив, база и стратегия не должны разъехаться молча.
+    """
+    names = [
+        cfg.reporting.benchmark,
+        cfg.regime_filter.benchmark,
+        cfg.regime_filter.risk_off_asset,
+    ]
+    return list(dict.fromkeys(str(n).upper() for n in names if n))
+
+
+def load_funds(
+    conn: duckdb.DuckDBPyConnection,
+    provider: sharadar.SharadarProvider,
+    tickers_raw,
+    instruments: list[str],
+    *,
+    force: bool = False,
+) -> dict[str, int]:
+    """Догружает в базу цены бенчмарка и защитного актива (ТЗ 7.1, 10).
+
+    Они лежат в отдельной таблице поставщика (`funds`, прежний SFP) — `stocks`
+    содержит только акции. Без этого шага база собирается целиком и выглядит
+    исправной, а SPY в ней нет: сравнение с рынком пропускается предупреждением в
+    логе, а режимный фильтр падает на первой же дате.
+    """
+    if not instruments:
+        return {"fund_securities": 0, "fund_prices": 0}
+
+    fund_map = sharadar.build_ticker_map(tickers_raw, sharadar.FUNDS_TABLE)
+    securities = sharadar.normalize_tickers(
+        tickers_raw, source_table=sharadar.FUNDS_TABLE, only=instruments
+    )
+    raw = provider.fetch_fund_prices(instruments, force=force)
+    prices = sharadar.normalize_funds(raw, fund_map)
+
+    counts = {
+        "fund_securities": _insert(conn, "securities", securities),
+        "fund_prices": _insert(conn, "prices", prices),
+    }
+    log.info("Вне вселенной загружены: %s", ", ".join(instruments))
+    return counts
+
+
+def add_funds_everywhere(
+    cfg, provider: sharadar.SharadarProvider, *, force: bool = False
+) -> dict[str, int]:
+    """Догружает бенчмарк и защитный актив в уже собранные базы.
+
+    Отдельный режим, а не пересборка: полная база — четыре гигабайта, и повторное
+    разрезание на периоды стоит часа работы и всей оперативной памяти контейнера.
+    Две бумаги за тридцать лет — пятнадцать тысяч строк.
+
+    Про hold-out. Файл периода открывается на запись напрямую, минуя замок ТЗ 9.1.
+    Замок защищает от чтения результатов, а здесь в файл только добавляются цены
+    двух ETF; ни одна цифра оттуда не читается и не попадает в отчёт. Собирать
+    hold-out заведомо неполным ради формальности означало бы, что его
+    единственный разрешённый прогон пройдёт без режимного фильтра.
+    """
+    instruments = benchmark_instruments(cfg)
+    if not instruments:
+        log.warning("В конфиге не задан ни бенчмарк, ни защитный актив: нечего грузить.")
+        return {}
+
+    tickers_raw = provider.fetch_table("tickers", force=force)
+    fund_map = sharadar.build_ticker_map(tickers_raw, sharadar.FUNDS_TABLE)
+    securities = sharadar.normalize_tickers(
+        tickers_raw, source_table=sharadar.FUNDS_TABLE, only=instruments
+    )
+    prices = sharadar.normalize_funds(
+        provider.fetch_fund_prices(instruments, force=force), fund_map
+    )
+    log.info("Загружено из funds: %d строк цен по %s", len(prices), ", ".join(instruments))
+
+    counts: dict[str, int] = {}
+    targets: list[tuple[str, Path, date | None, date | None]] = [
+        ("full", Path(cfg.data.full_db), None, None)
+    ]
+    for name, period in PERIODS.items():
+        targets.append((
+            name,
+            period_path(cfg.data.processed_dir, name),
+            period.warmup_start(cfg.periods.warmup_days),
+            period.end,
+        ))
+
+    for name, path, lo, hi in targets:
+        if not path.exists():
+            log.warning("%s: файла нет (%s), пропускаю", name, path)
+            continue
+        window = prices
+        if lo is not None:
+            dates = pd.to_datetime(prices["date"])
+            window = prices.loc[(dates >= pd.Timestamp(lo)) & (dates <= pd.Timestamp(hi))]
+        conn = duckdb.connect(str(path))
+        try:
+            _insert(conn, "securities", securities, quiet=True)
+            counts[name] = _insert(conn, "prices", window, quiet=True)
+        finally:
+            conn.close()
+        log.info("  %-11s %s: +%d строк цен", name, path.name, counts.get(name, 0))
 
     return counts
 
@@ -177,6 +292,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true", help="игнорировать кэш сырья")
     parser.add_argument("--skip-split", action="store_true",
                         help="не резать на периоды (только полная база)")
+    parser.add_argument("--funds-only", action="store_true",
+                        help="только догрузить бенчмарк и защитный актив "
+                             "в уже собранные базы (ТЗ 7.1, 10)")
     parser.add_argument("--check-access", action="store_true",
                         help="только проверить, какие таблицы отдаёт ключ, и выйти")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -206,6 +324,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.check_access:
         return 0
+
+    if args.funds_only:
+        log.info("Догрузка бенчмарка и защитного актива в собранные базы")
+        add_funds_everywhere(cfg, provider, force=args.force)
+        return 0
     if not all(access[t].ok for t in sharadar.OPTIONAL_TABLES):
         log.warning(
             "Часть таблиц вне тарифа. База соберётся, но полнота данных ниже "
@@ -215,6 +338,7 @@ def main(argv: list[str] | None = None) -> int:
     log.info("Сборка полной базы: %s", cfg.data.full_db)
     counts = build_full_database(
         provider, cfg.data.full_db,
+        instruments=benchmark_instruments(cfg),
         load_daily_control=cfg.data.load_daily_control, force=args.force,
     )
     for table, n in counts.items():

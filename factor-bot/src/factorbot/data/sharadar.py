@@ -41,17 +41,35 @@ log = logging.getLogger(__name__)
 API_ROOT = "https://api.sharadar.com/v1.0"
 
 #: Таблицы ТЗ 4.2 в именах прямого API. В скобках прежние коды: fundamentals =
-#: SF1, stocks = SEP. `daily` — только контрольный источник (ТЗ 4.4).
-TABLES: tuple[str, ...] = ("tickers", "stocks", "fundamentals", "actions", "daily")
+#: SF1, stocks = SEP, funds = SFP. `daily` — только контрольный источник (ТЗ 4.4).
+TABLES: tuple[str, ...] = (
+    "tickers", "stocks", "fundamentals", "actions", "daily", "funds",
+)
 
 #: Без этих трёх не собирается ничего: справочник задаёт вселенную и карту
 #: permaticker, stocks даёт momentum, fundamentals — value.
 REQUIRED_TABLES: tuple[str, ...] = ("tickers", "stocks", "fundamentals")
 
 #: `actions` нужна для корректных delisting returns (ТЗ 4.1), `daily` — только
-#: для сверки (ТЗ 4.4). Их отсутствие на урезанном тарифе не должно ронять
-#: загрузку, но обязано быть видно: без actions результат завышен систематически.
-OPTIONAL_TABLES: tuple[str, ...] = ("actions", "daily")
+#: для сверки (ТЗ 4.4), `funds` — для бенчмарка и защитного актива. Их отсутствие
+#: на урезанном тарифе не должно ронять загрузку, но обязано быть видно: без
+#: actions результат завышен систематически, а без funds не собирается ни
+#: режимный фильтр (ТЗ 7.1), ни сравнение с рынком (ТЗ 10).
+OPTIONAL_TABLES: tuple[str, ...] = ("actions", "daily", "funds")
+
+#: Цены ETF лежат у поставщика отдельно от акций: `stocks` (SEP) — только акции,
+#: фонды живут в `funds` (прежний SFP). Забыть об этом легко и незаметно: база
+#: собирается целиком, тесты проходят, а SPY в ней просто нет, и сравнение с
+#: рынком тихо пропускается. Поэтому бенчмарк и защитный актив грузятся отдельным
+#: шагом, а не «если попадётся».
+FUNDS_TABLE = "funds"
+
+#: Страниц на одну бумагу при постраничном чтении `funds`. Тридцать лет дневных
+#: цен — порядка 7500 строк, поставщик отдаёт их одним ответом, но полагаться на
+#: это нельзя: молча усечённая история бенчмарка сдвинет SMA-200 и весь режимный
+#: фильтр. Предел стоит здесь, чтобы дефект справочника не превратился в
+#: бесконечный цикл запросов.
+MAX_FUND_PAGES = 40
 
 #: Сколько строк читать за раз у больших таблиц. Два миллиона строк цен — это
 #: порядка гигабайта в pandas, что оставляет запас даже в тесном контейнере.
@@ -189,6 +207,107 @@ class SharadarProvider(DataProvider):
                 for i, chunk in enumerate(reader, start=1):
                     log.info("%s: порция %d, строк %d", table, i, len(chunk))
                     yield chunk
+
+    def fetch_fund_prices(
+        self, tickers: list[str] | tuple[str, ...], *, force: bool = False
+    ) -> pd.DataFrame:
+        """Цены фондов из таблицы `funds` (прежний SFP) по списку тикеров.
+
+        Здесь единственное место, где выгрузка идёт не целиком, а по бумагам, и
+        это осознанное отступление от ТЗ 4.2. Причина: из девяти с лишним тысяч
+        фондов в работе участвуют два — бенчмарк (ТЗ 7.1, 10) и защитный актив
+        (ТЗ 7.1). Полная таблица фондов — ещё пара гигабайт сырья и столько же в
+        базе, которые никогда не будут прочитаны. Запрета ТЗ 4.2 это не нарушает
+        по сути: запрет там про вселенную, чтобы отбор бумаг не зависел от того,
+        какие тикеры пришли в голову разработчику. Бенчмарк во вселенную не
+        входит вовсе (ТЗ 5).
+
+        Returns:
+            Сырые строки поставщика, как в bulk-выгрузке `funds`.
+        """
+        # Приводим к верхнему регистру до снятия дубликатов, а не после: SPY стоит
+        # в конфиге дважды — бенчмарком отчёта (ТЗ 10) и бенчмарком режимного
+        # фильтра (ТЗ 7.1), и написан там может быть по-разному.
+        wanted = dict.fromkeys(str(t).upper() for t in tickers)
+        frames = [self._fund_ticker_prices(t, force=force) for t in wanted]
+        frames = [f for f in frames if not f.empty]
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    def _fund_ticker_prices(self, ticker: str, *, force: bool = False) -> pd.DataFrame:
+        """История одной бумаги: из кэша или постранично из сети."""
+        cached = self._cached_fund_path(ticker)
+        if cached is not None and not force:
+            log.info("funds/%s: беру из кэша %s", ticker, cached)
+            return pd.read_csv(cached, low_memory=False)
+
+        if not self.api_key:
+            raise SharadarError(
+                f"Нет ключа Sharadar и нет кэша для funds/{ticker}. Задайте "
+                f"SHARADAR_API_KEY или положите CSV в {self.cache_dir / FUNDS_TABLE}."
+            )
+
+        df = self._download_fund_history(ticker)
+        target = self.cache_dir / FUNDS_TABLE / f"{ticker}-{date.today().isoformat()}.csv"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(target, index=False)
+        log.info("funds/%s: %d строк, %s — %s", ticker, len(df),
+                 df["date"].min(), df["date"].max())
+        return df
+
+    def _download_fund_history(self, ticker: str) -> pd.DataFrame:
+        """Читает историю бумаги страницами назад по датам.
+
+        Поставщик отдаёт строки от свежих к старым и вправе ограничить ответ.
+        Молча усечённая история бенчмарка опаснее ошибки загрузки: SMA-200
+        посчитается, режимный фильтр заработает, и неверным будет только
+        результат. Поэтому запросы идут до тех пор, пока появляются новые даты, а
+        не до первого непустого ответа.
+        """
+        pages: list[pd.DataFrame] = []
+        oldest: date | None = None
+
+        for _ in range(MAX_FUND_PAGES):
+            params: dict[str, object] = {"ticker": ticker}
+            if oldest is not None:
+                params["date.lte"] = oldest.isoformat()
+            r = requests.get(
+                f"{API_ROOT}/data/{FUNDS_TABLE}",
+                params=params,
+                headers=self._headers,
+                timeout=self.timeout_s,
+            )
+            self._raise_for_status(r, FUNDS_TABLE)
+            page = pd.read_csv(io.StringIO(r.text), low_memory=False)
+            if page.empty:
+                break
+
+            pages.append(page)
+            page_oldest = pd.to_datetime(page["date"]).min().date()
+            if oldest is not None and page_oldest >= oldest:
+                break  # страница не добавила ни одного дня — история кончилась
+            oldest = page_oldest
+        else:
+            raise SharadarError(
+                f"funds/{ticker}: история не кончилась за {MAX_FUND_PAGES} страниц. "
+                "Дальше грузить нельзя: результат был бы усечён незаметно."
+            )
+
+        if not pages:
+            raise SharadarError(
+                f"funds/{ticker}: поставщик не отдал ни одной строки. Бумага есть "
+                "в справочнике фондов? Проверьте тикер и тариф."
+            )
+        out = pd.concat(pages, ignore_index=True)
+        return out.drop_duplicates(subset=["ticker", "date"], keep="last")
+
+    def _cached_fund_path(self, ticker: str) -> Path | None:
+        d = self.cache_dir / FUNDS_TABLE
+        if not d.is_dir():
+            return None
+        files = sorted(d.glob(f"{ticker}-*.csv"))
+        return files[-1] if files else None
 
     def _ensure_archive(self, table: str, *, force: bool = False) -> Path:
         """Путь к архиву таблицы: из кэша или после скачивания."""
@@ -353,6 +472,7 @@ TABLE_ALIASES: dict[str, set[str]] = {
     "actions": {"actions"},
     "daily": {"daily"},
     "tickers": {"tickers"},
+    "funds": {"funds", "sfp"},
 }
 
 
@@ -456,11 +576,35 @@ def attach_permaticker(
 # --------------------------------------------------------------------------- #
 
 
-def normalize_tickers(tickers_raw: pd.DataFrame) -> pd.DataFrame:
-    """`tickers` → securities. Одна строка на permaticker."""
+def normalize_tickers(
+    tickers_raw: pd.DataFrame,
+    *,
+    source_table: str = "stocks",
+    only: list[str] | tuple[str, ...] | None = None,
+) -> pd.DataFrame:
+    """`tickers` → securities. Одна строка на permaticker.
+
+    Args:
+        source_table: какую часть справочника брать. `stocks` — акции, из них и
+            состоит вселенная (ТЗ 5). `funds` — фонды; оттуда нужны ровно
+            бенчмарк и защитный актив, и они во вселенную не попадают: категория
+            «ETF» отсеивается фильтром ТЗ 5 сама.
+        only: оставить только эти тикеры. Строка справочника без цен в базе
+            безвредна, но вводит в заблуждение: бумага «есть», а панель по ней
+            пуста.
+    """
     df = tickers_raw.loc[
-        tickers_raw["table"].str.lower().isin(_table_aliases("stocks"))
+        tickers_raw["table"].str.lower().isin(_table_aliases(source_table))
     ].copy()
+    if only is not None:
+        wanted = {t.upper() for t in only}
+        df = df.loc[df["ticker"].astype("string").str.upper().isin(wanted)]
+        missing = wanted - set(df["ticker"].astype("string").str.upper())
+        if missing:
+            raise SharadarError(
+                f"В справочнике {source_table} нет бумаг: {sorted(missing)}. "
+                "Проверьте тикеры в конфиге."
+            )
     out = pd.DataFrame({
         "permaticker": pd.to_numeric(df["permaticker"], errors="coerce").astype("Int64"),
         "ticker": df["ticker"].astype("string"),
@@ -499,6 +643,18 @@ def normalize_sep(sep_raw: pd.DataFrame, tmap: pd.DataFrame) -> pd.DataFrame:
     })
     out["dollar_volume"] = out["close_unadj"] * out["volume"]
     return out.drop_duplicates(subset=["permaticker", "date"], keep="last").reset_index(drop=True)
+
+
+def normalize_funds(funds_raw: pd.DataFrame, tmap: pd.DataFrame) -> pd.DataFrame:
+    """`funds` (SFP) → prices. Колонки у поставщика те же, что у акций.
+
+    Бенчмарк и защитный актив живут в той же таблице цен, что и акции, — это
+    сознательное решение. Отдельная таблица под два ETF означала бы второй путь
+    чтения цен: панель, режимный фильтр и отчёт брали бы данные из разных мест, и
+    расхождение между ними никто бы не заметил. Из вселенной они выпадают по
+    категории (ТЗ 5), а не по тому, в какой таблице лежат.
+    """
+    return normalize_sep(funds_raw, tmap)
 
 
 def normalize_sf1(

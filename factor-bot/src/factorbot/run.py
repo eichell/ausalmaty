@@ -128,8 +128,11 @@ def open_run_context(cfg, period_name: str) -> RunContext:
         securities = conn.execute("SELECT * FROM securities").df()
         corp_actions = conn.execute("SELECT * FROM corp_actions").df()
         benchmark = load_benchmark(conn, cfg.reporting.benchmark)
+        # Нескорректированная цена, а не closeadj: выплата при поглощении указана
+        # в тогдашних долларах, и делить её на цену, пересчитанную от другой
+        # базы, нельзя (см. backtest/delisting.py).
         last_prices = (
-            panel.closeadj.ffill().iloc[-1] if len(panel.closeadj) else pd.Series()
+            panel.close_unadj.ffill().iloc[-1] if len(panel.close_unadj) else pd.Series()
         )
         delisting = build_delisting_returns(securities, corp_actions, last_prices)
     except Exception:
@@ -451,7 +454,7 @@ def _print_report(args, result, net: M.Metrics, gross: M.Metrics, benchmark,
     print("\nПо годам:")
     print(yearly.to_string(float_format=lambda v: f"{v:7.2%}"))
 
-    for flag in M.sanity_warnings(net):
+    for flag in M.sanity_warnings(net, yearly):
         print(f"\n[!] {flag}")
 
 

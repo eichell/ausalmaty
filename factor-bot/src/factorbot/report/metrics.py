@@ -159,25 +159,82 @@ def summarize(result, benchmark: pd.Series | None = None, *, gross: bool = False
     )
 
 
-def sanity_warnings(metrics: Metrics) -> list[str]:
+#: Потолки правдоподобия для проверки ТЗ 9.3. Это не пороги «правильности», а
+#: границы, за которыми результат объясняется ошибкой, а не стратегией.
+#:
+#: Порядок величин задан ТЗ 9.3: CAGR на несколько процентных пунктов выше S&P 500,
+#: Sharpe 0.6–0.9, просадка 35–50%. Потолки поставлены с большим запасом, чтобы
+#: сработать на дефекте, а не на удачном периоде.
+PLAUSIBLE_MAX_CAGR = 0.40
+PLAUSIBLE_MAX_VOLATILITY = 0.60
+PLAUSIBLE_MAX_SHARPE = 1.5
+PLAUSIBLE_MIN_DRAWDOWN = -0.25
+
+#: С какой длины прогона отсутствие ни одного убыточного года становится
+#: признаком дефекта, а не везения.
+YEARS_WITHOUT_LOSS_SUSPICIOUS = 10
+
+
+def sanity_warnings(metrics: Metrics, yearly: pd.DataFrame | None = None) -> list[str]:
     """Признаки, что что-то не так (ТЗ 9.3).
 
     Не проверка корректности, а список поводов искать ошибку у себя. Реалистичный
     ориентир для честно построенной версии: CAGR на несколько процентных пунктов
     выше S&P 500, Sharpe 0.6–0.9, максимальная просадка 35–50%.
+
+    Список писался по ТЗ и не поймал первый настоящий дефект проекта: выплата при
+    делистинге считалась из капитализации компании, CAGR вышел 1878% при
+    волатильности 401%, и обе проверки — Sharpe 1.39 и просадка −48% — оказались в
+    пределах нормы. Поэтому здесь теперь есть потолки на сами уровни доходности и
+    риска, а не только на их отношение, и отдельная проверка на год без убытка:
+    стратегия, которая четырнадцать лет подряд не теряет денег, не существует.
+
+    Args:
+        yearly: доходности по календарным годам. Без них проверка по годам
+            пропускается — молча, потому что она дополнительная.
     """
     flags: list[str] = []
-    if metrics.sharpe > 1.5:
+    if metrics.cagr > PLAUSIBLE_MAX_CAGR:
         flags.append(
-            f"Sharpe {metrics.sharpe:.2f} > 1.5 на месячной ребалансировке акций — "
-            "для честно построенной версии это слишком хорошо (ТЗ 9.3)."
+            f"CAGR {metrics.cagr:.1%} выше {PLAUSIBLE_MAX_CAGR:.0%} в год — на "
+            "акциях с месячной ребалансировкой это не результат стратегии, а "
+            "ошибка в данных или в учёте (ТЗ 9.3)."
         )
-    if metrics.max_drawdown > -0.25:
+    if metrics.volatility > PLAUSIBLE_MAX_VOLATILITY:
         flags.append(
-            f"Максимальная просадка {metrics.max_drawdown:.1%} мельче 25% — "
-            "проверьте, попали ли в выборку 2000-е и 2008 год (ТЗ 9.3)."
+            f"Волатильность {metrics.volatility:.1%} в год выше "
+            f"{PLAUSIBLE_MAX_VOLATILITY:.0%} — портфель из 30 акций так не "
+            "колеблется. Ищите отдельные бумаги с невозможной дневной "
+            "доходностью (ТЗ 9.3)."
         )
+    if metrics.sharpe > PLAUSIBLE_MAX_SHARPE:
+        flags.append(
+            f"Sharpe {metrics.sharpe:.2f} > {PLAUSIBLE_MAX_SHARPE} на месячной "
+            "ребалансировке акций — для честно построенной версии это слишком "
+            "хорошо (ТЗ 9.3)."
+        )
+    if metrics.max_drawdown > PLAUSIBLE_MIN_DRAWDOWN:
+        flags.append(
+            f"Максимальная просадка {metrics.max_drawdown:.1%} мельче "
+            f"{abs(PLAUSIBLE_MIN_DRAWDOWN):.0%} — проверьте, попали ли в выборку "
+            "2000-е и 2008 год (ТЗ 9.3)."
+        )
+    flags.extend(_yearly_warnings(yearly))
     return flags
+
+
+def _yearly_warnings(yearly: pd.DataFrame | None) -> list[str]:
+    """Проверка по календарным годам: ни одного убыточного — это дефект."""
+    if yearly is None or "strategy" not in yearly or len(yearly) < YEARS_WITHOUT_LOSS_SUSPICIOUS:
+        return []
+    losses = int((yearly["strategy"] < 0).sum())
+    if losses:
+        return []
+    return [
+        f"Ни одного убыточного года из {len(yearly)} — включая 2000–2002 и 2008, "
+        "если они в выборке. Такой стратегии не существует; ищите ошибку в учёте "
+        "(ТЗ 9.3)."
+    ]
 
 
 def _years(equity: pd.Series) -> float:

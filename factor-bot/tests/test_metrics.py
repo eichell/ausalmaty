@@ -137,3 +137,56 @@ def test_realistic_result_raises_no_flags():
         n_rebalances=168, average_holding_months=6.7, total_return=4.2, years=14,
     )
     assert M.sanity_warnings(metrics) == []
+
+
+# --------------------------------------------------------------------------- #
+# Проверка на реальность ТЗ 9.3: регресс на настоящем дефекте
+# --------------------------------------------------------------------------- #
+
+
+def _metrics(**over) -> M.Metrics:
+    base = dict(
+        cagr=0.13, volatility=0.18, sharpe=0.75, sortino=1.05, max_drawdown=-0.42,
+        max_drawdown_months=28, max_underperformance_months=19, annual_turnover=1.8,
+        n_rebalances=168, average_holding_months=6.7, total_return=4.2, years=14,
+    )
+    return M.Metrics(**{**base, **over})
+
+
+def test_the_delisting_defect_would_now_be_caught():
+    """Настоящие цифры первого прогона momentum на данных Sharadar.
+
+    Sharpe 1.39 и просадка −48.4% тогда прошли обе проверки: выплата при
+    делистинге считалась из капитализации компании, и дефект остался незамеченным
+    до разбора вручную. Уровни доходности и волатильности были невозможны.
+    """
+    broken = _metrics(cagr=18.78, volatility=4.016, sharpe=1.39, max_drawdown=-0.484)
+    flags = M.sanity_warnings(broken)
+    assert any("CAGR" in f for f in flags)
+    assert any("Волатильность" in f for f in flags)
+
+
+def test_impossible_cagr_is_flagged():
+    assert any("CAGR" in f for f in M.sanity_warnings(_metrics(cagr=0.9)))
+
+
+def test_impossible_volatility_is_flagged():
+    assert any("Волатильность" in f for f in M.sanity_warnings(_metrics(volatility=0.9)))
+
+
+def test_a_long_run_without_a_single_losing_year_is_flagged():
+    yearly = pd.DataFrame({"strategy": [0.10] * 14}, index=range(1999, 2013))
+    flags = M.sanity_warnings(_metrics(), yearly)
+    assert any("убыточного года" in f for f in flags)
+
+
+def test_a_losing_year_removes_the_flag():
+    strategy = [0.10] * 13 + [-0.35]
+    yearly = pd.DataFrame({"strategy": strategy}, index=range(1999, 2013))
+    assert M.sanity_warnings(_metrics(), yearly) == []
+
+
+def test_short_run_is_not_judged_by_years():
+    """На трёх годах отсутствие убыточного — не признак дефекта."""
+    yearly = pd.DataFrame({"strategy": [0.10, 0.12, 0.08]}, index=range(2010, 2013))
+    assert M.sanity_warnings(_metrics(), yearly) == []

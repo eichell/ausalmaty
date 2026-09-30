@@ -7,11 +7,13 @@ from datetime import date
 import duckdb
 import pandas as pd
 import pytest
-from test_sharadar import TICKERS_RAW
+from test_sharadar import ALL_TICKERS_RAW, TICKERS_RAW
 
+from factorbot.config import load_config
 from factorbot.data import pit, sharadar
-from factorbot.data.build import build_full_database, preflight
+from factorbot.data.build import benchmark_instruments, build_full_database, preflight
 from factorbot.data.provider import DataProvider
+from factorbot.universe import UniverseRules, eligible_securities
 
 SEP_RAW = pd.DataFrame([
     {"ticker": "AAA", "date": "2004-06-01", "open": 9.5, "high": 10.5, "low": 9.0,
@@ -225,3 +227,71 @@ def test_probe_without_a_key_says_so_instead_of_calling_out(monkeypatch):
     state = provider.probe_table("stocks")
     assert not state.ok
     assert "SHARADAR_API_KEY" in state.detail
+
+
+# --------------------------------------------------------------------------- #
+# Бенчмарк и защитный актив (ТЗ 7.1, 10)
+# --------------------------------------------------------------------------- #
+
+FUND_PRICES_RAW = pd.DataFrame([
+    {"ticker": "SPY", "date": "2004-06-01", "open": 111.0, "high": 112.0, "low": 110.0,
+     "close": 111.5, "closeadj": 80.0, "closeunadj": 111.5, "volume": 5e7},
+    {"ticker": "SHY", "date": "2004-06-01", "open": 81.0, "high": 81.2, "low": 80.9,
+     "close": 81.0, "closeadj": 60.0, "closeunadj": 81.0, "volume": 1e6},
+])
+
+
+class FundProvider(FakeProvider):
+    """Тот же поставщик, но со справочником фондов и их ценами."""
+
+    _tables = dict(FakeProvider._tables, tickers=ALL_TICKERS_RAW)
+
+    def fetch_fund_prices(self, tickers, *, force: bool = False) -> pd.DataFrame:
+        wanted = {t.upper() for t in tickers}
+        return FUND_PRICES_RAW.loc[FUND_PRICES_RAW["ticker"].isin(wanted)].copy()
+
+
+@pytest.fixture
+def built_with_funds(tmp_path):
+    path = tmp_path / "full.duckdb"
+    counts = build_full_database(FundProvider(), path, instruments=["SPY", "SHY"])
+    return path, counts
+
+
+def test_benchmark_lands_in_the_same_price_table_as_stocks(built_with_funds):
+    """Иначе панель, режимный фильтр и отчёт читали бы цены из разных мест."""
+    path, counts = built_with_funds
+    assert counts["fund_prices"] == 2
+    conn = duckdb.connect(str(path), read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT s.ticker FROM prices p JOIN securities s USING (permaticker) "
+            "WHERE s.ticker IN ('SPY', 'SHY')"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert sorted(r[0] for r in rows) == ["SHY", "SPY"]
+
+
+def test_benchmark_does_not_enter_the_universe(built_with_funds):
+    """ETF отсеивается по категории (ТЗ 5), а не по таблице, из которой приехал."""
+    path, _ = built_with_funds
+    conn = duckdb.connect(str(path), read_only=True)
+    try:
+        securities = conn.execute("SELECT * FROM securities").df()
+    finally:
+        conn.close()
+    eligible = eligible_securities(securities, UniverseRules())
+    assert 118691 not in set(eligible)
+    assert 118012 not in set(eligible)
+
+
+def test_build_without_instruments_touches_nothing(built):
+    """Прежнее поведение сохранено: без списка бумаг шаг не выполняется."""
+    _, counts = built
+    assert counts["fund_prices"] == 0
+
+
+def test_benchmark_list_comes_from_the_config_without_duplicates():
+    cfg = load_config("config/strategy.yaml")
+    assert benchmark_instruments(cfg) == ["SPY", "SHY"]
