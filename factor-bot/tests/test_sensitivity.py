@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from factorbot import sensitivity as S
 from factorbot.config import Section, with_overrides
 from factorbot.sensitivity import (
     DEFAULT_SWEEPS,
@@ -199,3 +200,40 @@ def test_shuffle_test_runs_the_real_case_once_and_the_rest_shuffled():
     assert calls.count(None) == 1
     assert result.real == pytest.approx(1.0)
     assert result.shuffled == [0.0] * 5
+
+
+# --------------------------------------------------------------------------- #
+# Сводка ТЗ 9.2 обязана говорить, на чём посчитан DSR
+# --------------------------------------------------------------------------- #
+
+
+def test_report_warns_when_the_spread_is_a_guess_not_a_measurement():
+    """Без карты чувствительности DSR считается по консервативной оценке.
+
+    Порог перебора от этого вырастает в несколько раз. Один и тот же прогон дал
+    DSR 0.837 с измеренным разбросом и 0.540 с оценкой — и оба числа печатались
+    под одним именем, пока это не всплыло.
+    """
+    rng = np.random.default_rng(0)
+    returns = pd.Series(rng.normal(0.0005, 0.01, 2000))
+    text = S.overfitting_report([], None, returns, experiments_log="нет такого файла")
+    assert "консервативной оценкой" in text
+    assert "сравнивать нельзя" in text
+
+
+def test_report_stays_silent_about_the_spread_when_the_map_was_built():
+    rng = np.random.default_rng(0)
+    returns = pd.Series(rng.normal(0.0005, 0.01, 2000))
+    table = pd.DataFrame({"sharpe": [0.70, 0.72, 0.65], "cagr": [0.1, 0.1, 0.1],
+                          "max_drawdown": [-0.3] * 3, "turnover": [3.0] * 3},
+                         index=[189, 252, 315])
+    verdict = S.SweepVerdict("окно", table, 252, 0.72, 0.9, True)
+    text = S.overfitting_report([verdict], None, returns,
+                                experiments_log="нет такого файла")
+    assert "консервативной оценкой" not in text
+
+
+def test_empty_map_does_not_print_an_empty_section():
+    returns = pd.Series(np.random.default_rng(1).normal(0.0005, 0.01, 500))
+    text = S.overfitting_report([], None, returns, experiments_log="нет такого файла")
+    assert "Карты чувствительности (ТЗ 9.2.2):" not in text

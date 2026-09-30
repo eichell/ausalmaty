@@ -197,7 +197,7 @@ def run_backtest(
     stop_rules = stop_rules or StopLossRules()
     limits = limits or PositionLimits()
     throttle = throttle or TradeThrottle()
-    closeadj = panel.closeadj.ffill()
+    closeadj = panel.filled_closeadj
     last_alive = panel.last_quote
 
     rebalance_dates = [d for d in panel.month_end_dates() if start <= d <= end]

@@ -77,6 +77,19 @@ class PricePanel:
         return first.where(present.any(), other=pd.NaT).rename("first_quote")
 
     @cached_property
+    def filled_closeadj(self) -> pd.DataFrame:
+        """Скорректированная цена с переносом последней известной вперёд.
+
+        Нужна движку для переоценки позиций: остановка торгов на день не доход и
+        не убыток. Считается один раз на панель — при тридцати одном прогоне карты
+        чувствительности (ТЗ 9.2.2) это была секунда на прогон впустую.
+
+        Уход бумаги навсегда переносом не маскируется: делистинг обрабатывается
+        отдельно, по `last_quote`.
+        """
+        return self.closeadj.ffill()
+
+    @cached_property
     def last_quote(self) -> pd.Series:
         """Дата последней котировки: permaticker → дата или NaT.
 

@@ -309,9 +309,10 @@ def overfitting_report(
     """Сводка раздела 9.2 одним текстом."""
     lines = ["=== защита от переподгонки (ТЗ 9.2) ==="]
 
-    lines.append("\nКарты чувствительности (ТЗ 9.2.2):")
-    for verdict in verdicts:
-        lines.append("  " + verdict.summary())
+    if verdicts:
+        lines.append("\nКарты чувствительности (ТЗ 9.2.2):")
+        for verdict in verdicts:
+            lines.append("  " + verdict.summary())
 
     if shuffle is not None:
         lines.append("\nПеремешанные данные (ТЗ 9.2.4):")
@@ -324,6 +325,18 @@ def overfitting_report(
     variance = sharpe_variance_from_trials(all_sharpes)
 
     lines.append("\nDeflated Sharpe (ТЗ 9.2.5):")
+    if variance <= 0:
+        # Без карты чувствительности разброс Sharpe между испытаниями взять
+        # неоткуда, и формула переходит на консервативную оценку 1/(T−1). Порог
+        # перебора от этого вырастает в несколько раз, и DSR получается сильно
+        # ниже. Не сказать об этом — значит выдать два несравнимых числа под
+        # одним именем: ровно это и произошло, когда появился ключ --only.
+        lines.append(
+            "  Карта чувствительности в этом прогоне не строилась, поэтому разброс "
+            "Sharpe между испытаниями взят консервативной оценкой, а не измерен. "
+            "Порог перебора от этого завышен, DSR занижен, и с прогоном, где карта "
+            "была, это число сравнивать нельзя."
+        )
     try:
         dsr = deflated_sharpe_ratio(
             returns, n_trials=n_trials,
@@ -363,6 +376,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--shuffles", type=int, default=20,
                         help="сколько прогонов на перемешанных сигналах (ТЗ 9.2.4)")
     parser.add_argument("--no-shuffle", action="store_true")
+    parser.add_argument("--only", default="all", choices=["all", "sweeps", "shuffle"],
+                        help="часть раздела 9.2: карты, перестановки или всё")
+    parser.add_argument(
+        "--regime", default="config", choices=["config", "on", "off"],
+        help="режимный фильтр ТЗ 7.1. Для теста ТЗ 9.2.4 это решающий выбор: с "
+             "включённым фильтром перемешанные прогоны наследуют его защиту, и "
+             "тест отвечает не про отбор бумаг, а про фильтр",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -374,23 +395,28 @@ def main(argv: list[str] | None = None) -> int:
     base_cfg = load_config(args.config)
     context = open_run_context(base_cfg, args.period)
 
+    regime = {"config": None, "on": True, "off": False}[args.regime]
+
     try:
         def run_with(overrides: dict[str, Any]) -> pd.Series:
             context.cfg = with_overrides(base_cfg, overrides)
-            result = execute(context, args.strategy)
+            result = execute(context, args.strategy, regime_enabled=regime)
             return metrics_row(result, context.benchmark)
 
-        verdicts = [run_sweep(run_with, spec, metric=args.metric)
-                    for spec in DEFAULT_SWEEPS]
+        verdicts = []
+        if args.only in ("all", "sweeps"):
+            verdicts = [run_sweep(run_with, spec, metric=args.metric)
+                        for spec in DEFAULT_SWEEPS]
 
         context.cfg = base_cfg
-        baseline = execute(context, args.strategy)
+        baseline = execute(context, args.strategy, regime_enabled=regime)
 
         shuffle = None
-        if not args.no_shuffle:
+        if not args.no_shuffle and args.only in ("all", "shuffle"):
             def run_shuffled(wrapper) -> pd.Series:
                 context.cfg = base_cfg
-                result = execute(context, args.strategy, score_wrapper=wrapper)
+                result = execute(context, args.strategy, score_wrapper=wrapper,
+                                 regime_enabled=regime)
                 return metrics_row(result, context.benchmark)
 
             shuffle = shuffle_test(
@@ -400,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         context.close()
 
+    print(f"\n(режимный фильтр: {args.regime}; метрика: {args.metric})")
     for verdict in verdicts:
         print(f"\n--- {verdict.spec_name} ---")
         print(verdict.table.to_string(float_format=lambda v: f"{v:8.3f}"))
