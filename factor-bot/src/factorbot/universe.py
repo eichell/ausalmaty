@@ -112,9 +112,8 @@ def build_universe(
     # панели, а не по справочнику — так бумага, чьи данные начинаются позже
     # заявленного, не пролезет.
     history_start = as_of - pd.DateOffset(months=rules.min_price_history_months)
-    closeadj = panel.closeadj.reindex(columns=columns)
-    first_seen = closeadj.apply(lambda col: col.first_valid_index())
-    long_enough = first_seen.notna() & (pd.to_datetime(first_seen) <= history_start)
+    first_seen = panel.first_quote.reindex(columns)
+    long_enough = first_seen.notna() & (first_seen <= history_start)
 
     keep = (
         traded_today

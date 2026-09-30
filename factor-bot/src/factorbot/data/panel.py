@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import date
+from functools import cached_property
 
 import duckdb
 import pandas as pd
@@ -48,6 +49,43 @@ class PricePanel:
     @property
     def tickers(self) -> pd.Index:
         return self.closeadj.columns
+
+    @cached_property
+    def first_quote(self) -> pd.Series:
+        """Дата первой котировки каждой бумаги: permaticker → дата или NaT.
+
+        Считается один раз на панель, а не на каждой дате ребалансировки. Это не
+        оптимизация ради оптимизации: фильтр глубины истории (ТЗ 5) вызывал
+        `first_valid_index` по каждой из тринадцати тысяч колонок на каждой из 165
+        дат, и на это уходило 88% времени прогона — восемь минут вместо одной.
+        Цена этого — не только ожидание: карты чувствительности (ТЗ 9.2.2)
+        прогоняют стратегию десятки раз, и при такой скорости раздел 9 просто не
+        выполняется за разумное время.
+
+        Утечки здесь нет, и порядок вычисления её не создаёт. Значение считается
+        по всей панели, но смысл его — «когда бумага впервые появилась», то есть
+        событие прошлого. Для бумаги, чья первая котировка позже даты
+        ребалансировки, фильтр `first_quote <= history_start` даёт False, и она
+        выбывает — ровно как если бы о ней ещё ничего не было известно.
+        """
+        # notna().idxmax() возвращает первую строку с True, но для колонки без
+        # единого значения даёт первую дату вместо NaT — поэтому пустые гасятся
+        # отдельно. Ошибиться здесь значит впустить в вселенную бумагу, которой
+        # на эту дату не существовало.
+        present = self.closeadj.notna()
+        first = present.idxmax()
+        return first.where(present.any(), other=pd.NaT).rename("first_quote")
+
+    @cached_property
+    def last_quote(self) -> pd.Series:
+        """Дата последней котировки: permaticker → дата или NaT.
+
+        Движок определяет делистинг по ней (ТЗ 4.1), и считалась она тем же
+        построчным перебором, что и первая.
+        """
+        present = self.closeadj.notna()
+        last = present[::-1].idxmax()
+        return last.where(present.any(), other=pd.NaT).rename("last_quote")
 
     def returns(self) -> pd.DataFrame:
         """Дневные доходности из скорректированной цены."""

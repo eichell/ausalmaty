@@ -175,3 +175,55 @@ def test_empty_universe_writes_nothing(caplog):
     finally:
         conn.close()
     assert any("записывать нечего" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# Границы истории котировок на уровне панели
+# --------------------------------------------------------------------------- #
+
+
+def test_first_and_last_quote_are_the_real_boundaries():
+    from factorbot.data.panel import PricePanel
+
+    days = pd.bdate_range("2010-01-04", periods=5, name="date")
+    closeadj = pd.DataFrame(
+        {
+            10: [np.nan, 1.0, 2.0, 3.0, np.nan],   # торговалась в середине
+            11: [1.0, 1.0, 1.0, 1.0, 1.0],          # всю историю
+            12: [np.nan] * 5,                       # ни одной котировки
+        },
+        index=days,
+    )
+    panel = PricePanel(closeadj, closeadj, closeadj, closeadj)
+
+    assert panel.first_quote[10] == days[1]
+    assert panel.last_quote[10] == days[3]
+    assert panel.first_quote[11] == days[0]
+    assert panel.last_quote[11] == days[-1]
+
+
+def test_security_without_a_single_quote_has_no_boundaries():
+    """idxmax на колонке из одних NaN отдаёт первую дату вместо NaT.
+
+    Пропустить это значит впустить в вселенную бумагу, которой на эту дату не
+    существовало, и посчитать по ней momentum из пустоты.
+    """
+    from factorbot.data.panel import PricePanel
+
+    days = pd.bdate_range("2010-01-04", periods=5, name="date")
+    closeadj = pd.DataFrame({12: [np.nan] * 5}, index=days)
+    panel = PricePanel(closeadj, closeadj, closeadj, closeadj)
+
+    assert pd.isna(panel.first_quote[12])
+    assert pd.isna(panel.last_quote[12])
+
+
+def test_boundaries_are_computed_once_per_panel():
+    """Пересчёт на каждой дате ребалансировки стоил 88% времени прогона."""
+    from factorbot.data.panel import PricePanel
+
+    days = pd.bdate_range("2010-01-04", periods=5, name="date")
+    closeadj = pd.DataFrame({10: [1.0] * 5}, index=days)
+    panel = PricePanel(closeadj, closeadj, closeadj, closeadj)
+    assert panel.first_quote is panel.first_quote
+    assert panel.last_quote is panel.last_quote

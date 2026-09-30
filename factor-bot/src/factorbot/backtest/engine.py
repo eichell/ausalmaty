@@ -198,7 +198,7 @@ def run_backtest(
     limits = limits or PositionLimits()
     throttle = throttle or TradeThrottle()
     closeadj = panel.closeadj.ffill()
-    last_alive = panel.closeadj.apply(lambda col: col.last_valid_index())
+    last_alive = panel.last_quote
 
     rebalance_dates = [d for d in panel.month_end_dates() if start <= d <= end]
     if not rebalance_dates:
