@@ -385,3 +385,46 @@ def test_overlays_show_up_in_the_file_name():
                                    regime="on", stops="off")) == "composite_in_sample_regime"
     assert run_tag(SimpleNamespace(strategy="value", period="validation",
                                    regime="off", stops="on")) == "value_validation_stops"
+
+
+def test_decomposition_follows_the_overlays_of_the_report_above_it(db, monkeypatch, capsys):
+    """Иначе в одном выводе стоят две разные стратегии под одной подписью.
+
+    Прогон с `--regime off` печатал композит +0.48% в отчёте и −2.88% в
+    разложении: разложение брало оверлеи из конфига, а не из ключей прогона.
+    """
+    from types import SimpleNamespace
+
+    from factorbot import run as R
+
+    seen: list[dict] = []
+
+    class FakeContext:
+        def close(self):
+            pass
+
+    def fake_open(cfg, period):
+        return FakeContext()
+
+    def fake_execute(context, strategy, *, regime_enabled=None, stops_enabled=None,
+                     score_wrapper=None):
+        seen.append({"strategy": strategy, "regime": regime_enabled,
+                     "stops": stops_enabled})
+        return "result"
+
+    monkeypatch.setattr(R, "open_run_context", fake_open)
+    monkeypatch.setattr(R, "execute", fake_execute)
+    monkeypatch.setattr(R.M, "summarize", lambda *a, **kw: R.M.Metrics(
+        cagr=0.1, volatility=0.2, sharpe=0.5, sortino=0.6, max_drawdown=-0.3,
+        max_drawdown_months=10, max_underperformance_months=5, annual_turnover=3.0,
+        n_rebalances=80, average_holding_months=3.0, total_return=1.0, years=7.0,
+    ))
+
+    args = SimpleNamespace(period="validation")
+    R._print_decomposition(None, args, pd.Series(dtype="float64"),
+                           regime_enabled=False, stops_enabled=False)
+
+    assert [row["strategy"] for row in seen] == ["momentum", "value", "composite"]
+    assert all(row["regime"] is False for row in seen)
+    assert all(row["stops"] is False for row in seen)
+    assert "без фильтра" in capsys.readouterr().out

@@ -328,7 +328,9 @@ def main(argv: list[str] | None = None) -> int:
         _print_stop_comparison(stop_results, benchmark)
 
     if args.decompose:
-        _print_decomposition(cfg, args, benchmark)
+        _print_decomposition(cfg, args, benchmark,
+                             regime_enabled=wanted[-1],
+                             stops_enabled=stop_variants[-1])
 
     if args.save_universe:
         _save_universe(cfg, args.period, primary)
@@ -374,22 +376,37 @@ def _save_universe(cfg, period_name: str, result) -> None:
         conn.close()
 
 
-def _print_decomposition(cfg, args, benchmark) -> None:
+def _print_decomposition(
+    cfg, args, benchmark, *, regime_enabled: bool, stops_enabled: bool
+) -> None:
     """Разложение вклада: momentum отдельно, value отдельно, композит (ТЗ 10).
 
     Композит, который не лучше лучшей из своих половин, — повод не радоваться
     результату, а спросить, зачем в нём вторая половина.
+
+    Оверлеи обязаны совпадать с теми, на которых построен отчёт выше. Пока они
+    брались из конфига, прогон с `--regime off` печатал композит +0.48% в отчёте
+    и −2.88% в разложении — две разные стратегии под одной подписью в одном
+    выводе. Такую таблицу нельзя ни сравнить с отчётом, ни проверить.
     """
     context = open_run_context(cfg, args.period)
     try:
         parts = {
-            name: M.summarize(execute(context, name), benchmark)
+            name: M.summarize(
+                execute(context, name, regime_enabled=regime_enabled,
+                        stops_enabled=stops_enabled),
+                benchmark,
+            )
             for name in ("momentum", "value", "composite")
         }
     finally:
         context.close()
 
-    print("\n=== разложение вклада (ТЗ 10) ===")
+    overlays = ", ".join(filter(None, [
+        "режимный фильтр" if regime_enabled else "без фильтра",
+        "стоп-лоссы" if stops_enabled else None,
+    ]))
+    print(f"\n=== разложение вклада (ТЗ 10); {overlays} ===")
     print(f"{'':24}{'momentum':>14}{'value':>14}{'композит':>14}")
     for label, attr, fmt in [
         ("CAGR", "cagr", "{:.2%}"),
