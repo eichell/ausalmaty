@@ -43,14 +43,21 @@ def build_full_database(
     недоступны. Загрузка в этом случае продолжается, но пропуск фиксируется в
     логе предупреждением: без `ACTIONS` банкротство выглядит как исчезновение из
     выборки, а не как −100%, и результат завышается систематически.
+
+    Сборка идёт во временный файл и подменяет прежнюю базу только после успеха.
+    Прежняя версия удаляла базу до первого запроса к поставщику, и однажды это
+    стоило дорого: подписка кончилась между сборками, скачивание упало на отказе
+    403, а рабочая база была уже уничтожена — вместе с единственной возможностью
+    посчитать сигнал. Для архивов такая дисциплина уже была (`.part` в
+    `_download_bulk`); базе она нужна ровно по той же причине.
     """
     instruments = list(instruments or [])
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    if db_path.exists():
-        db_path.unlink()
+    partial = db_path.with_suffix(db_path.suffix + ".part")
+    partial.unlink(missing_ok=True)
 
-    conn = duckdb.connect(str(db_path))
+    conn = duckdb.connect(str(partial))
     counts: dict[str, int] = {}
     try:
         create_all(conn)
@@ -103,9 +110,16 @@ def build_full_database(
                 lambda chunk: sharadar.normalize_daily(chunk, sep_map),
                 force=force, optional=True,
             )
-    finally:
+    except BaseException:
         conn.close()
+        # Недособранная база хуже отсутствующей: по ней нельзя ни считать, ни
+        # понять, чего в ней не хватает. Прежняя остаётся на месте.
+        partial.unlink(missing_ok=True)
+        raise
+    conn.close()
 
+    partial.replace(db_path)
+    log.info("База собрана и подменена: %s", db_path)
     return counts
 
 

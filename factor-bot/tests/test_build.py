@@ -299,3 +299,45 @@ def test_benchmark_list_comes_from_the_config_without_duplicates():
     # откуда его позвали.
     cfg = load_config(Path(__file__).resolve().parents[1] / "config" / "strategy.yaml")
     assert benchmark_instruments(cfg) == ["SPY", "SHY"]
+
+
+# --------------------------------------------------------------------------- #
+# Сборка не должна уничтожать прежнюю базу при сбое
+# --------------------------------------------------------------------------- #
+
+
+class FailingProvider(FundProvider):
+    """Поставщик, который падает на ценах — как при кончившейся подписке."""
+
+    def iter_table(self, table: str, *, chunksize: int = 0, force: bool = False):
+        if table == "stocks":
+            raise sharadar.SubscriptionError("stocks: нет доступа по подписке")
+        yield from super().iter_table(table, chunksize=chunksize, force=force)
+
+
+def test_failed_build_leaves_the_previous_database_intact(tmp_path):
+    """Подписка кончилась между сборками — прежняя база обязана остаться.
+
+    Прежняя версия удаляла файл до первого запроса к поставщику, и реальный отказ
+    403 уничтожил рабочую базу вместе с возможностью посчитать сигнал.
+    """
+    path = tmp_path / "full.duckdb"
+    build_full_database(FundProvider(), path, instruments=["SPY", "SHY"])
+    before = path.read_bytes()
+
+    with pytest.raises(sharadar.SubscriptionError):
+        build_full_database(FailingProvider(), path, instruments=["SPY", "SHY"])
+
+    assert path.exists(), "прежняя база уничтожена сбоем сборки"
+    assert path.read_bytes() == before, "прежняя база повреждена"
+    assert not list(tmp_path.glob("*.part")), "недособранный файл остался на диске"
+
+
+def test_successful_build_replaces_the_previous_database(tmp_path):
+    path = tmp_path / "full.duckdb"
+    build_full_database(FakeProvider(), path)
+    first = path.stat().st_mtime_ns
+    counts = build_full_database(FundProvider(), path, instruments=["SPY", "SHY"])
+    assert counts["fund_prices"] == 2
+    assert path.stat().st_mtime_ns != first
+    assert not list(tmp_path.glob("*.part"))
